@@ -1,0 +1,24 @@
+name: build-windows
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install packages
+        run: pip install -r requirements.txt
+      - name: Build Babelo.exe
+        run: pyinstaller --noconfirm --clean --onedir --windowed --name Babelo --collect-all faster_whisper --collect-all ctranslate2 --collect-all tokenizers --collect-all av --collect-all pyaudiowpatch --collect-all sentencepiece --collect-all edge_tts --collect-all pycaw --hidden-import win32com.client --hidden-import pythoncom --hidden-import comtypes babelo.py
+      - name: Zip
+        run: Compress-Archive -Path dist\Babelo -DestinationPath Babelo-windows.zip
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "win-${{ github.run_number }}" Babelo-windows.zip --title "Babelo for Windows ${{ github.run_number }}" --notes "Unzip, run Babelo.exe, download models, press F10"
