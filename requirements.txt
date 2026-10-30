@@ -1,0 +1,12 @@
+numpy
+faster-whisper
+ctranslate2
+sentencepiece
+huggingface_hub
+PyAudioWPatch
+pycaw
+comtypes
+psutil
+pywin32
+edge-tts
+pyinstaller
