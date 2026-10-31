@@ -5,6 +5,12 @@ F10: первое нажатие — перевод включён; ещё ра�
 Распознавание (Whisper) -> перевод (NLLB) -> озвучка (голос Windows или Edge), оригинал заглушается, субтитры белым по чёрному.
 """
 import os, sys, json, time, threading, queue, ctypes, traceback, re, tempfile, math, gc
+
+# программа без консоли: у неё нет stdout/stderr, а библиотеки в них пишут
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
 from ctypes import wintypes
 
 if os.name != "nt":
@@ -52,12 +58,14 @@ DEFAULTS = {"target": "ru", "source": "auto", "whisper": "small", "phrase_sec": 
 
 # ---------------------------------------------------------------- журнал и настройки
 LOG_LINES = []
+LOG_TOTAL = [0]
 _log_lock = threading.Lock()
 
 def log(msg):
     line = time.strftime("%H:%M:%S ") + str(msg)
     with _log_lock:
         LOG_LINES.append(line)
+        LOG_TOTAL[0] += 1
         del LOG_LINES[:-300]
         try:
             with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -98,6 +106,83 @@ def to16k(x, sr):
     return np.interp(idx, np.arange(len(x)), x)
 
 # ---------------------------------------------------------------- модели
+class Cancelled(Exception):
+    pass
+
+def fmt_time(sec):
+    sec = int(max(0, sec))
+    return "%d мин %02d с" % (sec // 60, sec % 60) if sec >= 60 else "%d с" % sec
+
+def fetch_repo(repo, patterns, dest, title, progress, cancel):
+    """Скачивает файлы модели с huggingface.co: с докачкой, с прогрессом, без tqdm и без Xet (они у вас зависали)."""
+    import requests, fnmatch, urllib.parse
+    headers = {"User-Agent": "Babelo/2"}
+    progress("%s: связываюсь с huggingface.co…" % title, None)
+    r = requests.get("https://huggingface.co/api/models/%s" % repo, params={"blobs": "true"}, headers=headers, timeout=30)
+    r.raise_for_status()
+    files = [(s["rfilename"], int(s.get("size") or 0)) for s in r.json().get("siblings", [])
+             if any(fnmatch.fnmatch(s["rfilename"], p) for p in patterns)]
+    if not files:
+        raise RuntimeError("в репозитории %s нет файлов модели" % repo)
+    total = sum(sz for _, sz in files) or 1
+    got_done = 0
+    last_ui, last_b, last_t, speed = 0.0, 0, time.time(), 0.0
+    os.makedirs(dest, exist_ok=True)
+    for name, size in files:
+        path = os.path.join(dest, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path) and (size == 0 or os.path.getsize(path) == size):
+            got_done += size or os.path.getsize(path)
+            continue
+        part = path + ".part"
+        attempts = 0
+        while True:
+            if cancel.is_set():
+                raise Cancelled()
+            have = os.path.getsize(part) if os.path.exists(part) else 0
+            try:
+                hdr = dict(headers)
+                if have:
+                    hdr["Range"] = "bytes=%d-" % have
+                url = "https://huggingface.co/%s/resolve/main/%s" % (repo, urllib.parse.quote(name))
+                with requests.get(url, headers=hdr, stream=True, timeout=(20, 40), allow_redirects=True) as resp:
+                    if resp.status_code == 416:                      # докачивать нечего
+                        break
+                    resp.raise_for_status()
+                    if have and resp.status_code != 206:
+                        have = 0                                     # сервер не умеет докачку — сначала
+                    with open(part, "ab" if have else "wb") as f:
+                        for chunk in resp.iter_content(1 << 20):
+                            if cancel.is_set():
+                                raise Cancelled()
+                            f.write(chunk)
+                            have += len(chunk)
+                            now = time.time()
+                            if now - last_ui > 0.4:
+                                cur = got_done + have
+                                inst = (cur - last_b) / max(now - last_t, 1e-3)
+                                speed = inst if speed == 0 else speed * 0.7 + inst * 0.3
+                                last_b, last_t, last_ui = cur, now, now
+                                eta = (total - cur) / speed if speed > 1 else 0
+                                progress("%s: %s — %d%%  (%d из %d МБ, %.1f МБ/с, осталось ~%s)" % (
+                                    title, name, cur * 100 // total, cur >> 20, total >> 20, speed / 1048576.0,
+                                    fmt_time(eta) if eta else "?"), cur / float(total))
+                break
+            except Cancelled:
+                raise
+            except Exception as e:
+                attempts += 1
+                if attempts >= 6:
+                    raise
+                log("обрыв связи при загрузке %s: %s — продолжаю (попытка %d)" % (name, str(e)[:80], attempts))
+                progress("%s: обрыв связи, продолжаю… (попытка %d)" % (title, attempts), None)
+                time.sleep(3)
+        if size and os.path.getsize(part) != size:
+            os.remove(part)
+            raise RuntimeError("файл %s скачан не полностью, нажмите «Скачать модели» ещё раз" % name)
+        os.replace(part, path)
+        got_done += size or os.path.getsize(path)
+
 class ModelHub:
     def __init__(self):
         self.whisper = None
@@ -114,16 +199,14 @@ class ModelHub:
         return (os.path.exists(os.path.join(self.whisper_dir(size), "model.bin"))
                 and os.path.exists(os.path.join(NLLB_DIR, "model.bin")))
 
-    def download(self, size, progress):
-        from faster_whisper.utils import download_model
-        import huggingface_hub
-        progress("Загрузка распознавания речи (Whisper %s)… это несколько минут" % size)
-        download_model(size, output_dir=self.whisper_dir(size))
-        progress("Загрузка модели перевода (NLLB, около 620 МБ)…")
-        huggingface_hub.snapshot_download(
-            "skywood/nllb-200-distilled-600M-ct2-int8", local_dir=NLLB_DIR,
-            allow_patterns=["config.json", "model.bin", "sentencepiece.bpe.model", "shared_vocabulary.json"])
-        progress("Модели готовы ✓")
+    def download(self, size, progress, cancel):
+        fetch_repo("Systran/faster-whisper-%s" % size,
+                   ["config.json", "preprocessor_config.json", "model.bin", "tokenizer.json", "vocabulary.*"],
+                   self.whisper_dir(size), "Распознавание речи (Whisper %s)" % size, progress, cancel)
+        fetch_repo("skywood/nllb-200-distilled-600M-ct2-int8",
+                   ["config.json", "model.bin", "sentencepiece.bpe.model", "shared_vocabulary.json"],
+                   NLLB_DIR, "Модель перевода (NLLB)", progress, cancel)
+        progress("Модели готовы ✓", 1.0)
 
     def load(self, size, threads):
         with self.lock:
@@ -359,6 +442,8 @@ class Engine:
         self.speak_q = queue.Queue()
         self.hist = []
         self.stats = {"heard": 0, "recognised": 0, "translated": 0, "spoken": 0, "errors": 0}
+        self.last_loud = 0.0
+        self.listening = False
 
     def start(self):
         for fn in (self.capture, self.worker, self.speaker):
@@ -394,6 +479,7 @@ class Engine:
             stream = p.open(format=pa.paInt16, channels=ch, rate=sr, frames_per_buffer=int(sr * 0.1), input=True,
                             input_device_index=spk["index"], stream_callback=cb)
             stream.start_stream()
+            self.listening = True
             log("слушаю: %s (%d Гц, %d кан.)" % (spk["name"], sr, ch))
             buf, n_samples, silent = [], 0, 0
             while not self.stop_evt.is_set():
@@ -410,7 +496,9 @@ class Engine:
                 if self.gate:
                     buf, n_samples, silent = [], 0, 0
                     continue
-                loud = len(m) > 0 and float(np.abs(m).mean()) > 0.012
+                loud = len(m) > 0 and float(np.abs(m).mean()) > 0.010
+                if loud:
+                    self.last_loud = time.time()
                 silent = 0 if loud else silent + 1
                 if loud or buf:
                     buf.append(m)
@@ -690,7 +778,7 @@ class App:
         except Exception:
             pass
         self.root = tk.Tk()
-        self.root.title("Babelo")
+        self.root.title("Babelo for Windows v2")
         self.root.geometry("640x720")
         self.events = queue.Queue()
         self.engine = None
@@ -702,7 +790,11 @@ class App:
         self.menu = Menu(self)
         self.hidden_note = False
         self.log_shown = 0
+        self.dl_cancel = threading.Event()
+        self.dl_thread = None
         self._build_main()
+        self.refresh_models_state()
+        self.root.after(1000, self._tick)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_main)
         threading.Thread(target=self._hotkey, daemon=True).start()
         self.root.after(50, self._poll)
@@ -722,9 +814,9 @@ class App:
         except queue.Empty:
             pass
         with _log_lock:
-            n = len(LOG_LINES)
-            fresh = LOG_LINES[self.log_shown:] if n >= self.log_shown else LOG_LINES[:]
-            self.log_shown = n
+            new = LOG_TOTAL[0] - self.log_shown
+            fresh = LOG_LINES[-new:] if new > 0 else []
+            self.log_shown = LOG_TOTAL[0]
         if fresh:
             self.logbox.config(state="normal")
             for line in fresh:
@@ -867,6 +959,7 @@ class App:
         def pick_whisper(_=None):
             CFG["whisper"] = self.v_whisper.get()
             save_settings()
+            self.refresh_models_state()
             if not HUB.ready(CFG["whisper"]):
                 self.set_status("Для модели %s нужна загрузка — нажмите «Скачать модели»." % CFG["whisper"])
 
@@ -910,23 +1003,71 @@ class App:
             save_settings()
         ttk.Checkbutton(r, text="Заглушать оригинал на время перевода", variable=self.v_mute, command=chg).pack(anchor="w", **pad)
 
+        self.models_lbl = ttk.Label(r, text="", font=("Segoe UI", 9, "bold"))
+        self.models_lbl.pack(anchor="w", padx=10)
+        self.dl_label = ttk.Label(r, text="Загрузка не идёт.", wraplength=600)
+        self.dl_label.pack(anchor="w", padx=10)
+        self.dl_bar = ttk.Progressbar(r, maximum=100)
+        self.dl_bar.pack(fill="x", padx=10, pady=2)
+        self.stats_lbl = ttk.Label(r, text="Перевод выключен.", wraplength=600)
+        self.stats_lbl.pack(anchor="w", padx=10, pady=2)
         bar = ttk.Frame(r)
         bar.pack(fill="x", **pad)
         ttk.Button(bar, text="Скачать модели", command=self.download).pack(side="left", padx=4)
+        ttk.Button(bar, text="Отмена загрузки", command=lambda: self.dl_cancel.set()).pack(side="left", padx=4)
         ttk.Button(bar, text="Проверить голос", command=self.test_voice).pack(side="left", padx=4)
         ttk.Button(bar, text="Полное закрытие программы", command=self.full_close).pack(side="right", padx=4)
         self.logbox = tk.Text(r, height=12, state="disabled", bg="#111", fg="#ddd", font=("Consolas", 9))
         self.logbox.pack(fill="both", expand=True, **pad)
         ttk.Label(r, text="F10: включить · ещё раз: меню · два раза подряд: выключить").pack(pady=4)
 
+    def refresh_models_state(self):
+        w = os.path.exists(os.path.join(HUB.whisper_dir(CFG["whisper"]), "model.bin"))
+        n = os.path.exists(os.path.join(NLLB_DIR, "model.bin"))
+        self.models_lbl.config(text="Модели:  распознавание (%s) — %s     перевод (NLLB) — %s" % (
+            CFG["whisper"], "✓ скачано" if w else "✗ нет", "✓ скачано" if n else "✗ нет"))
+
+    def _on_progress(self, text, frac):
+        self.dl_label.config(text=text)
+        if frac is not None:
+            self.dl_bar["value"] = frac * 100
+
     def download(self):
+        if self.dl_thread is not None and self.dl_thread.is_alive():
+            self.set_status("Загрузка уже идёт — следите за полосой ниже.")
+            return
+        self.dl_cancel.clear()
+        self.dl_bar["value"] = 0
+
         def run():
             try:
-                HUB.download(CFG["whisper"], lambda t: self.ui(self.set_status, t))
+                HUB.download(CFG["whisper"], lambda t, f: self.ui(self._on_progress, t, f), self.dl_cancel)
+                self.ui(self.set_status, "Модели готовы ✓ Включите видео и нажмите F10.")
+            except Cancelled:
+                self.ui(self.set_status, "Загрузка отменена. «Скачать модели» продолжит с того же места.")
             except Exception as e:
-                self.ui(self.set_status, "Ошибка загрузки: %s (проверьте интернет и нажмите ещё раз)" % e)
+                self.ui(self.set_status, "Ошибка загрузки: %s. Проверьте интернет и нажмите «Скачать модели» — загрузка продолжится." % e)
                 log(traceback.format_exc())
-        threading.Thread(target=run, daemon=True).start()
+            finally:
+                self.ui(self.refresh_models_state)
+        self.dl_thread = threading.Thread(target=run, daemon=True)
+        self.dl_thread.start()
+        self.set_status("Загрузка моделей началась — прогресс на полосе ниже.")
+
+    def _tick(self):
+        e = self.engine
+        if e is None:
+            txt = "Перевод выключен. F10 — включить."
+        else:
+            if not e.listening:
+                sound = "подключаюсь к звуку компьютера…"
+            else:
+                sound = "звук идёт" if time.time() - e.last_loud < 2 else "тихо (включите видео или музыку)"
+            s = e.stats
+            txt = "Перевод включён · слышу: %s · фраз услышано %d, распознано %d, переведено %d, озвучено %d, ошибок %d" % (
+                sound, s["heard"], s["recognised"], s["translated"], s["spoken"], s["errors"])
+        self.stats_lbl.config(text=txt)
+        self.root.after(1000, self._tick)
 
     def test_voice(self):
         def run():

@@ -1,4 +1,5 @@
 numpy
+requests
 faster-whisper
 ctranslate2
 sentencepiece
