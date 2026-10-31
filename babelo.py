@@ -4,7 +4,7 @@ Babelo для Windows — живой перевод любого звука, к�
 F10: первое нажатие — перевод включён; ещё раз — выезжает меню; два раза подряд — перевод выключен.
 Распознавание (Whisper) -> перевод (NLLB) -> озвучка (голос Windows или Edge), оригинал заглушается, субтитры белым по чёрному.
 """
-import os, sys, json, time, threading, queue, ctypes, traceback, re, tempfile, math, gc
+import os, sys, json, time, threading, queue, ctypes, traceback, re, tempfile, math, gc, subprocess
 
 # программа без консоли: у неё нет stdout/stderr, а библиотеки в них пишут
 if sys.stdout is None:
@@ -22,6 +22,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP = "Babelo"
+APP_BUILD = 0                      # номер сборки: при сборке на GitHub подставляется автоматически
+UPDATE_REPO = "panaceaun-cmd/babelo-windows"
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP)
 MODELS_DIR = os.path.join(DATA, "models")
 NLLB_DIR = os.path.join(MODELS_DIR, "nllb")
@@ -54,7 +56,7 @@ WHISPER_SIZES = ["tiny", "base", "small", "medium", "large-v3"]
 TEST_PHRASE = {"ru": "Привет! Это проверка голоса Babelo.", "en": "Hello! This is a Babelo voice test."}
 
 DEFAULTS = {"target": "ru", "source": "auto", "whisper": "small", "phrase_sec": 5, "pause_ms": 400,
-            "speed": 100, "volume": 100, "mute_original": True, "engine": "sapi", "voice": "", "threads": 4}
+            "speed": 100, "volume": 100, "mute_original": True, "engine": "sapi", "voice": "", "threads": 4, "github_token": ""}
 
 # ---------------------------------------------------------------- журнал и настройки
 LOG_LINES = []
@@ -182,6 +184,93 @@ def fetch_repo(repo, patterns, dest, title, progress, cancel):
             raise RuntimeError("файл %s скачан не полностью, нажмите «Скачать модели» ещё раз" % name)
         os.replace(part, path)
         got_done += size or os.path.getsize(path)
+
+# ---------------------------------------------------------------- обновления
+def gh_headers(accept="application/vnd.github+json"):
+    h = {"User-Agent": "Babelo", "Accept": accept}
+    tok = str(CFG.get("github_token", "")).strip()
+    if tok:
+        h["Authorization"] = "Bearer " + tok
+    return h
+
+def check_update():
+    """(номер последней сборки, файл Babelo-windows.zip) из последнего релиза на GitHub."""
+    import requests
+    r = requests.get("https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO, headers=gh_headers(), timeout=20)
+    if r.status_code == 404:
+        raise RuntimeError("релизы недоступны: репозиторий закрытый. Сделайте его публичным "
+                           "(Settings → Change visibility) или впишите токен GitHub в окне программы")
+    r.raise_for_status()
+    j = r.json()
+    m = re.search(r"(\d+)\s*$", j.get("tag_name", ""))
+    build = int(m.group(1)) if m else 0
+    asset = next((a for a in j.get("assets", []) if a["name"] == "Babelo-windows.zip"), None)
+    return build, asset
+
+def download_asset(asset, dest, progress, cancel):
+    import requests
+    tok = str(CFG.get("github_token", "")).strip()
+    url = asset["url"] if tok else asset["browser_download_url"]
+    hdr = gh_headers("application/octet-stream" if tok else "*/*")
+    total = int(asset.get("size") or 0) or 1
+    last = 0.0
+    last_b, last_t, speed = 0, time.time(), 0.0
+    for attempt in range(3):
+        try:
+            got = 0
+            with requests.get(url, headers=hdr, stream=True, timeout=(20, 40), allow_redirects=True) as resp:
+                resp.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in resp.iter_content(1 << 20):
+                        if cancel.is_set():
+                            raise Cancelled()
+                        f.write(chunk)
+                        got += len(chunk)
+                        now = time.time()
+                        if now - last > 0.4:
+                            inst = (got - last_b) / max(now - last_t, 1e-3)
+                            speed = inst if speed == 0 else speed * 0.7 + inst * 0.3
+                            last_b, last_t, last = got, now, now
+                            eta = (total - got) / speed if speed > 1 else 0
+                            progress("Обновление: %d%% (%d из %d МБ, %.1f МБ/с, осталось ~%s)" % (
+                                got * 100 // total, got >> 20, total >> 20, speed / 1048576.0, fmt_time(eta) if eta else "?"),
+                                got / float(total))
+            if got < total and int(asset.get("size") or 0):
+                raise RuntimeError("файл скачан не полностью")
+            return
+        except Cancelled:
+            raise
+        except Exception as e:
+            if attempt == 2:
+                raise
+            log("обрыв при загрузке обновления: %s — пробую ещё раз" % e)
+            time.sleep(3)
+
+def launch_updater(zip_path):
+    """Скрипт ждёт закрытия программы, распаковывает новую версию ПОВЕРХ старой и запускает её. Модели и настройки не трогает."""
+    app_dir = os.path.dirname(os.path.abspath(sys.executable))
+    tmp = os.path.join(tempfile.gettempdir(), "babelo_update_dir")
+    q = lambda p: p.replace("'", "''")
+    script = (
+        "$zip = '%s'; $app = '%s'; $tmp = '%s'; $logf = '%s'\r\n"
+        "Start-Sleep -Seconds 3\r\n"
+        "try {\r\n"
+        "  if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }\r\n"
+        "  New-Item -ItemType Directory -Force -Path $tmp | Out-Null\r\n"
+        "  tar -xf $zip -C $tmp\r\n"
+        "  if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $tmp 'Babelo'))) { Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force }\r\n"
+        "  robocopy \"$tmp\\Babelo\" \"$app\" /E /R:10 /W:2 /NFL /NDL /NJH /NJS | Out-Null\r\n"
+        "  if ($LASTEXITCODE -ge 8) { \"robocopy: ошибка $LASTEXITCODE\" | Out-File -Append $logf }\r\n"
+        "} catch { $_ | Out-File -Append $logf }\r\n"
+        "Start-Process -FilePath (Join-Path $app 'Babelo.exe')\r\n"
+        "Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue\r\n"
+        "Remove-Item -Force $zip -ErrorAction SilentlyContinue\r\n"
+    ) % (q(zip_path), q(app_dir), q(tmp), q(os.path.join(DATA, "update.log")))
+    ps1 = os.path.join(tempfile.gettempdir(), "babelo_update.ps1")
+    with open(ps1, "w", encoding="utf-8-sig") as f:
+        f.write(script)
+    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", ps1],
+                     creationflags=0x08000000 | 0x00000008, close_fds=True)
 
 class ModelHub:
     def __init__(self):
@@ -778,7 +867,7 @@ class App:
         except Exception:
             pass
         self.root = tk.Tk()
-        self.root.title("Babelo for Windows v2")
+        self.root.title("Babelo for Windows — сборка %d" % APP_BUILD)
         self.root.geometry("640x720")
         self.events = queue.Queue()
         self.engine = None
@@ -792,9 +881,11 @@ class App:
         self.log_shown = 0
         self.dl_cancel = threading.Event()
         self.dl_thread = None
+        self.pending_update = None
         self._build_main()
         self.refresh_models_state()
         self.root.after(1000, self._tick)
+        self.root.after(4000, lambda: self.check_updates(True))      # тихая проверка при запуске
         self.root.protocol("WM_DELETE_WINDOW", self.hide_main)
         threading.Thread(target=self._hotkey, daemon=True).start()
         self.root.after(50, self._poll)
@@ -1011,10 +1102,23 @@ class App:
         self.dl_bar.pack(fill="x", padx=10, pady=2)
         self.stats_lbl = ttk.Label(r, text="Перевод выключен.", wraplength=600)
         self.stats_lbl.pack(anchor="w", padx=10, pady=2)
+        tkf = ttk.Frame(r)
+        tkf.pack(fill="x", padx=10)
+        ttk.Label(tkf, text="Токен GitHub (нужен только если репозиторий закрытый):").pack(side="left")
+        self.v_token = tk.StringVar(value=str(CFG.get("github_token", "")))
+        te = ttk.Entry(tkf, textvariable=self.v_token, show="•", width=22)
+        te.pack(side="left", padx=6)
+
+        def save_token(_=None):
+            CFG["github_token"] = self.v_token.get().strip()
+            save_settings()
+        te.bind("<FocusOut>", save_token)
         bar = ttk.Frame(r)
         bar.pack(fill="x", **pad)
         ttk.Button(bar, text="Скачать модели", command=self.download).pack(side="left", padx=4)
         ttk.Button(bar, text="Отмена загрузки", command=lambda: self.dl_cancel.set()).pack(side="left", padx=4)
+        self.btn_update = ttk.Button(bar, text="Проверить обновления", command=self.on_update_btn)
+        self.btn_update.pack(side="left", padx=4)
         ttk.Button(bar, text="Проверить голос", command=self.test_voice).pack(side="left", padx=4)
         ttk.Button(bar, text="Полное закрытие программы", command=self.full_close).pack(side="right", padx=4)
         self.logbox = tk.Text(r, height=12, state="disabled", bg="#111", fg="#ddd", font=("Consolas", 9))
@@ -1053,6 +1157,77 @@ class App:
         self.dl_thread = threading.Thread(target=run, daemon=True)
         self.dl_thread.start()
         self.set_status("Загрузка моделей началась — прогресс на полосе ниже.")
+
+    # --- обновления: новая версия ставится ПОВЕРХ старой, модели и настройки остаются
+    def on_update_btn(self):
+        if self.pending_update:
+            self.install_update()
+        else:
+            self.check_updates(False)
+
+    def check_updates(self, silent=False):
+        def run():
+            try:
+                build, asset = check_update()
+                if build > APP_BUILD and asset:
+                    self.ui(self.offer_update, build, asset, silent)
+                elif not silent:
+                    self.ui(self.set_status, "У вас последняя версия (сборка %d)." % APP_BUILD)
+            except Exception as e:
+                log("проверка обновлений: %s" % e)
+                if not silent:
+                    self.ui(self.set_status, "Не удалось проверить обновления: %s" % e)
+        threading.Thread(target=run, daemon=True).start()
+
+    def offer_update(self, build, asset, silent):
+        self.pending_update = (build, asset)
+        self.btn_update.config(text="Установить обновление (сборка %d)" % build)
+        self.set_status("Вышла новая версия (сборка %d, у вас %d). Нажмите «Установить обновление»." % (build, APP_BUILD))
+        if silent and self.root.state() != "withdrawn" and self.engine is None:
+            if messagebox.askyesno("Babelo", "Вышла новая версия (сборка %d). Установить сейчас?\n"
+                                              "Модели и настройки сохранятся, удалять ничего не нужно." % build):
+                self.install_update()
+
+    def install_update(self):
+        if not getattr(sys, "frozen", False):
+            self.set_status("Обновление работает только в собранной программе Babelo.exe.")
+            return
+        if self.engine is not None:
+            self.set_status("Сначала выключите перевод (F10 два раза подряд), потом обновляйте.")
+            return
+        if not self.pending_update:
+            self.check_updates(False)
+            return
+        if self.dl_thread is not None and self.dl_thread.is_alive():
+            self.set_status("Загрузка уже идёт — следите за полосой ниже.")
+            return
+        build, asset = self.pending_update
+        zip_path = os.path.join(tempfile.gettempdir(), "Babelo-update-%d.zip" % build)
+        self.dl_cancel.clear()
+        self.dl_bar["value"] = 0
+
+        def run():
+            try:
+                download_asset(asset, zip_path, lambda t, f: self.ui(self._on_progress, t, f), self.dl_cancel)
+                self.ui(self._finish_update, zip_path)
+            except Cancelled:
+                self.ui(self.set_status, "Загрузка обновления отменена.")
+            except Exception as e:
+                self.ui(self.set_status, "Не удалось скачать обновление: %s" % e)
+                log(traceback.format_exc())
+        self.dl_thread = threading.Thread(target=run, daemon=True)
+        self.dl_thread.start()
+        self.set_status("Скачиваю обновление — прогресс на полосе ниже.")
+
+    def _finish_update(self, zip_path):
+        try:
+            launch_updater(zip_path)
+        except Exception as e:
+            self.set_status("Не удалось запустить установку обновления: %s" % e)
+            return
+        self.set_status("Устанавливаю обновление… программа закроется и откроется заново сама.")
+        self.muter.restore()
+        self.root.after(600, lambda: os._exit(0))
 
     def _tick(self):
         e = self.engine
