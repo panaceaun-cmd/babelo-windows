@@ -19,7 +19,7 @@ jobs:
           (Get-Content babelo.py -Raw -Encoding UTF8) -replace 'APP_BUILD = 0 ', 'APP_BUILD = ${{ github.run_number }} ' | Set-Content babelo.py -Encoding UTF8 -NoNewline
       - name: Build Babelo.exe
         run: |
-          pyinstaller --noconfirm --clean --onedir --windowed --name Babelo --collect-all faster_whisper --collect-all ctranslate2 --collect-all tokenizers --collect-all av --collect-all pyaudiowpatch --collect-all sentencepiece --collect-all edge_tts --collect-all pycaw --collect-all certifi --hidden-import win32com.client --hidden-import pythoncom --hidden-import comtypes babelo.py
+          pyinstaller --noconfirm --clean --onedir --windowed --name Babelo --collect-all faster_whisper --collect-all ctranslate2 --collect-all tokenizers --collect-all av --collect-all pyaudiowpatch --collect-all sentencepiece --collect-all edge_tts --collect-all pycaw --collect-all certifi --collect-all winsdk --hidden-import win32com.client --hidden-import pythoncom --hidden-import comtypes babelo.py
       - name: Zip
         run: |
           Compress-Archive -Path dist\Babelo -DestinationPath Babelo-windows.zip
