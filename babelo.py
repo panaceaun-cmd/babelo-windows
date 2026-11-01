@@ -58,7 +58,8 @@ TEST_PHRASE = {"ru": "Привет! Это проверка голоса Babelo.
 
 DEFAULTS = {"target": "ru", "source": "auto", "whisper": "small", "phrase_sec": 5, "pause_ms": 400,
             "speed": 100, "volume": 100, "mute_original": True, "engine": "sapi", "voice": "", "threads": 4, "github_token": "",
-            "mode": "live", "pause_s": 2, "repeats": 1, "block_sec": 60, "subs": "translated"}
+            "mode": "live", "pause_s": 2, "repeats": 1, "block_sec": 60, "subs": "translated",
+            "esc_stops": True, "banner_always": False}
 
 # ---------------------------------------------------------------- журнал и настройки
 LOG_LINES = []
@@ -813,6 +814,9 @@ class Phrase:
     def __init__(self, audio, t, prep, start, end):
         self.audio, self.t, self.prep, self.start, self.end = audio, t, prep, start, end
 
+class Restart(Exception):
+    """Видео обновили, запустили заново или перемотали: подгрузка начинается с нового места."""
+
 class Item:
     """Подготовленная фраза непрерывного перевода: когда она звучит в видео и что сказать."""
     def __init__(self, start, end, sub, speak, mp3, pct):
@@ -834,6 +838,9 @@ class Engine:
         self.stats = {"heard": 0, "recognised": 0, "translated": 0, "spoken": 0, "errors": 0}
         self.last_loud = 0.0
         self.listening = False
+        self.guard_until = 0.0             # до этого момента свои команды плееру не считаем действиями пользователя
+        self.spoken = set()
+        self.silent_prep = False
 
     def start(self):
         for fn in (self.capture, self.worker, self.speaker, self.controller):
@@ -1143,7 +1150,7 @@ class Engine:
             time.sleep(0.4)
             self.gate = False
 
-    # --- непрерывный режим: блок подгружается вперёд, потом идёт только перевод
+    # --- непрерывный режим: отрезок подгружается вперёд, потом видео идёт только с переводом
     def prepare(self, ph, tts):
         res = self.understand(ph.audio)
         if not res or ph.start is None or ph.end is None:
@@ -1161,6 +1168,8 @@ class Engine:
             except Exception as e:
                 log("Edge: %s" % e)
         self.items.append(Item(ph.start, ph.end, sub, speak, mp3, pct))
+        if self.phase == 1 and self.silent_prep:                        # беззвучная подгрузка: перевод хотя бы в субтитрах
+            self.app.ui(self.app.subs.show_sub, sub, "tr")
 
     def controller(self):
         com_init()
@@ -1180,6 +1189,43 @@ class Engine:
                 time.sleep(0.3)
         tts.stop_now()
 
+    def guard(self, sec=2.0):
+        self.guard_until = time.time() + sec
+
+    def make_watch(self):
+        """Замечает, что видео обновили, запустили заново или перемотали (не считая наших собственных команд)."""
+        media = self.app.media
+        w = {"playing": None, "pos": None, "t": None, "lost": None}
+
+        def watch():
+            st = media.info()
+            now = time.time()
+            if st is None:
+                if w["lost"] is None:
+                    w["lost"] = now
+                return None
+            if w["lost"] is not None:
+                gone = now - w["lost"]
+                w["lost"] = None
+                w["t"] = None
+                if gone > 0.7:
+                    return "страница или видео обновлены"
+            pos = media.position_ms()
+            if now < self.guard_until:
+                w.update(playing=st["playing"], pos=pos, t=now)
+                return None
+            reason = None
+            if w["t"] is not None:
+                if st["playing"] and not w["playing"]:
+                    reason = "видео запущено"
+                elif w["playing"] and pos is not None and w["pos"] is not None:
+                    expected = w["pos"] + (now - w["t"]) * 1000 * st["rate"]
+                    if abs(pos - expected) > 2500:
+                        reason = "видео перемотано"
+            w.update(playing=st["playing"], pos=pos, t=now)
+            return reason
+        return watch
+
     def continuous(self, tts):
         app = self.app
         media = app.media
@@ -1191,92 +1237,150 @@ class Engine:
             save_settings()
             app.ui(app.sync_ui)
             return
-        block = int(CFG["block_sec"]) * 1000
-        target = CFG["target"]
 
         def alive():
             return not self.stop_evt.is_set() and CFG["mode"] == "continuous"
+        first, next_start = True, None
         try:
             while alive():
-                p0 = media.position_ms() or 0
-                # 1. подготовка: блок проигрывается без звука, пока фразы распознаются и переводятся
-                self.items = []
-                self.loud_prep = 0
-                self.gate = False
-                self.phase = 1
-                muted = app.master.set(True)
-                media.play()
-                t0 = time.time()
-                unmuted = False
-                while alive():
-                    pos = media.position_ms() or p0
-                    pct = max(0, min(100, int((pos - p0) * 100 / block)))
-                    app.ui(app.subs.show, "Непрерывный перевод: подготовка %d %%" % pct)
-                    if pos >= p0 + block or time.time() - t0 > block / 1000.0 * 2 + 30:
-                        break
-                    if muted and not unmuted and pos - p0 > 6000 and self.loud_prep == 0:
-                        app.master.set(False)                   # без звука запись ничего не слышит — включаем
-                        unmuted = True
-                    time.sleep(0.3)
-                media.pause()
-                waited = 0
-                while alive() and waited < 480:
-                    with self.plock:
-                        left = self.pending
-                    if left <= 0:
-                        break
-                    app.ui(app.subs.show, "Непрерывный перевод: перевожу, осталось фраз: %d" % left)
-                    time.sleep(0.25)
-                    waited += 1
-                app.master.set(False)
-                if not alive():
-                    break
-                # 2. показ: видео идёт, оригинал выключен, каждая фраза начинается вместе с картинкой
-                items = sorted(self.items, key=lambda it: it.start)
-                self.phase = 2
-                self.gate = True
-                app.muter.mute()
-                media.seek(p0)
-                media.wait_near(p0)
-                media.play()
-                app.ui(app.subs.hide)
-                i, shown = 0, None
-                limit = time.time() + block / 1000.0 * 2 + 30
-                while alive() and time.time() < limit:
-                    pos = media.position_ms()
-                    if pos is None or pos >= p0 + block:
-                        break
-                    while i < len(items) and pos >= items[i].start - 250:
-                        it = items[i]
-                        i += 1
-                        if pos <= it.end:
-                            shown = it
-                            app.ui(app.subs.show_sub, it.sub, "tr")
-                            try:
-                                tts.say_now(it.speak, target, it.pct, it.mp3)
-                            except Exception as e:
-                                log("озвучка: %s" % e)
-                    if shown is not None and pos > shown.end + 300:
-                        app.ui(app.subs.hide)
-                        shown = None
-                    time.sleep(0.03)
-                tts.stop_now()
-                app.muter.restore()
-                app.ui(app.subs.hide)
-                self.stats["spoken"] += len(items)
-                for it in items:
-                    if it.mp3:
-                        try:
-                            os.remove(it.mp3)
-                        except Exception:
-                            pass
+                watch = self.make_watch()
+                try:
+                    next_start = self.cycle(tts, first, next_start, watch, alive)
+                    first = False                                  # дальше отрезки идут подряд: оригинал больше не слышен
+                except Restart as r:
+                    log("непрерывный режим: %s — подгрузка начинается заново" % r)
+                    first, next_start = True, None
+                    tts.stop_now()
+                    app.muter.restore()
+                    app.master.set(False)
+                    self.gate = False
+                    self.phase = 0
+                    app.ui(app.subs.hide)
+                    app.ui(app.banner_idle)
+                    self.wait(0.3)
         finally:
             app.master.set(False)
             app.muter.restore()
             tts.stop_now()
             self.phase = 0
             self.gate = False
-            media.play()
+            self.silent_prep = False
+            app.ui(app.banner_idle)
+            for it in self.items:
+                if it.mp3:
+                    try:
+                        os.remove(it.mp3)
+                    except Exception:
+                        pass
+
+    def cycle(self, tts, first, start_at, watch, alive):
+        """Один отрезок: подгрузка -> возврат на начало -> показ с переводом. Возвращает, откуда начнётся следующий."""
+        app = self.app
+        media = app.media
+        target = CFG["target"]
+        block = max(1, int(CFG["block_sec"])) * 1000
+        # --- 1. подгрузка. Первый отрезок идёт со слышимым оригиналом, следующие — без звука
+        if start_at is not None:
+            cur = media.position_ms()
+            if cur is not None and abs(cur - start_at) > 800:
+                self.guard(3.0)
+                media.seek(start_at)
+                media.wait_near(start_at)
+                self.guard(1.5)
+            p0 = start_at
+        else:
+            p0 = media.position_ms() or 0
+        self.items = []
+        self.spoken = set()
+        self.loud_prep = 0
+        self.gate = False
+        self.silent_prep = not first
+        self.phase = 1
+        muted = False if first else app.master.set(True)
+        if first:
+            self.guard(2.0)
+            media.play()                                           # видео запускается само
+        t_play, last, unmuted = 0.0, time.time(), False
+        while alive():
+            now = time.time()
+            st = media.info()
+            if st and st["playing"]:
+                t_play += now - last
+            last = now
+            r = watch()
+            if r:
+                raise Restart(r)
+            pos = media.position_ms() or p0
+            if pos >= p0 + block or t_play > block / 1000.0 * 2 + 30:
+                break
+            pct = max(0, min(100, int((pos - p0) * 100 / block)))
+            app.ui(app.banner.show, "Непрерывный перевод: подгрузка %d %% %s" % (
+                pct, "(оригинал слышно один раз)" if first else "(без звука, перевод — в субтитрах)"))
+            if muted and not unmuted and pos - p0 > 6000 and self.loud_prep == 0:
+                app.master.set(False)                              # без звука запись ничего не слышит — включаем
+                unmuted = True
+            time.sleep(0.15)
+        if not alive():
+            return None
+        # --- 2. ждём только первых готовых фраз: остальные доперевёдутся, пока видео идёт с переводом
+        t0 = time.time()
+        while alive() and time.time() - t0 < 8 and not self.items:
+            with self.plock:
+                left = self.pending
+            if left <= 0:
+                break
+            app.ui(app.banner.show, "Непрерывный перевод: перевожу первые фразы…")
+            time.sleep(0.2)
+        app.master.set(False)
+        self.phase = 2
+        self.gate = True
+        app.muter.mute()                                           # оригинал выключен, остаётся только голос перевода
+        app.ui(app.subs.hide)
+        self.guard(4.0)
+        media.seek(p0)
+        media.wait_near(p0)
+        self.guard(1.5)
+        app.ui(app.banner_idle)
+        # --- 3. показ с переводом; фразы, которые ещё доделываются, берутся по мере готовности
+        t_play, last, shown = 0.0, time.time(), None
+        while alive():
+            now = time.time()
+            st = media.info()
+            if st and st["playing"]:
+                t_play += now - last
+            last = now
+            r = watch()
+            if r:
+                raise Restart(r)
+            pos = media.position_ms()
+            if pos is None or pos >= p0 + block or t_play > block / 1000.0 * 2 + 30:
+                break
+            for it in sorted(list(self.items), key=lambda x: x.start):
+                if id(it) in self.spoken or pos < it.start - 250:
+                    continue
+                self.spoken.add(id(it))
+                if pos <= it.end + 1500:                           # не опоздавшие фразы
+                    shown = it
+                    app.ui(app.subs.show_sub, it.sub, "tr")
+                    try:
+                        tts.say_now(it.speak, target, it.pct, it.mp3)
+                    except Exception as e:
+                        log("озвучка: %s" % e)
+            if shown is not None and pos > shown.end + 300 and not tts.busy():
+                app.ui(app.subs.hide)
+                shown = None
+            time.sleep(0.03)
+        self.stats["spoken"] += len(self.spoken)
+        tts.wait_done(self.stop_evt, 15)                           # договорить последнюю фразу, пока видео идёт дальше
+        app.ui(app.subs.hide)
+        app.muter.restore()
+        for it in self.items:
+            if it.mp3:
+                try:
+                    os.remove(it.mp3)
+                except Exception:
+                    pass
+        return p0 + block
 
 # ---------------------------------------------------------------- окна
 import tkinter.font as tkfont
@@ -1372,7 +1476,7 @@ def add_controls(parent, dark, app):
 
     refresh.append(add_slider(parent, dark, "Прерывистый: пауза между фразой и переводом, с", 0, 10, "pause_s"))
     refresh.append(add_slider(parent, dark, "Прерывистый: сколько раз повторить (оригинал и перевод)", 1, 10, "repeats"))
-    refresh.append(add_slider(parent, dark, "Непрерывный: длина блока подгрузки вперёд, с", 20, 180, "block_sec"))
+    refresh.append(add_slider(parent, dark, "Непрерывный: длина отрезка подгрузки вперёд, с (1–180)", 1, 180, "block_sec"))
     refresh.append(add_slider(parent, dark, "Слушать фразу не дольше, с", 2, 15, "phrase_sec"))
     refresh.append(add_slider(parent, dark, "Пауза конца фразы, мс", 200, 1000, "pause_ms"))
     refresh.append(add_slider(parent, dark, "Скорость озвучки, %", 70, 150, "speed"))
@@ -1391,6 +1495,53 @@ def exstyle(win, clickthrough):
         u.SetWindowLongW(hwnd, -20, style)
     except Exception:
         pass
+
+HINT = "Перевод видео и аудио включён F10. Меню F10. Выключить — Esc или дважды F10"
+
+class Banner:
+    """Подсказка самого вверху экрана; мышь проходит сквозь неё."""
+    def __init__(self, root):
+        self.root = root
+        self.win = None
+        self.lbl = None
+        self.job = None
+
+    def _ensure(self):
+        if self.win is not None:
+            return
+        w = tk.Toplevel(self.root)
+        w.overrideredirect(True)
+        w.attributes("-topmost", True)
+        w.attributes("-alpha", 0.97)
+        w.configure(bg="black")
+        self.lbl = tk.Label(w, text="", fg="white", bg="black", font=("Segoe UI", 14, "bold"), padx=18, pady=8)
+        self.lbl.pack()
+        w.withdraw()
+        w.update_idletasks()
+        exstyle(w, True)
+        self.win = w
+
+    def show(self, text, ms=None):
+        self._ensure()
+        if self.job:
+            self.root.after_cancel(self.job)
+            self.job = None
+        self.lbl.config(text=text)
+        self.win.update_idletasks()
+        w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
+        sw = self.win.winfo_screenwidth()
+        self.win.geometry("%dx%d+%d+%d" % (w, h, max(0, (sw - w) // 2), 4))
+        self.win.deiconify()
+        self.win.lift()
+        if ms:
+            self.job = self.root.after(ms, self.hide)
+
+    def hide(self):
+        if self.job:
+            self.root.after_cancel(self.job)
+            self.job = None
+        if self.win is not None:
+            self.win.withdraw()
 
 class Subtitles:
     """Субтитры внизу экрана: белое на чёрном. Наведите мышь на слово перевода — сверху появится слово оригинала жёлтым."""
@@ -1650,7 +1801,9 @@ class App:
         self.master.recover()
         self.media = MediaCtl()
         self.subs = Subtitles(self.root)
+        self.banner = Banner(self.root)
         self.menu = Menu(self)
+        self.hk_tid = None
         self.hidden_note = False
         self.log_shown = 0
         self.dl_cancel = threading.Event()
@@ -1694,13 +1847,33 @@ class App:
     # --- F10
     def _hotkey(self):
         u = ctypes.windll.user32
+        msg = wintypes.MSG()
+        u.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)          # создаёт очередь сообщений потока
+        self.hk_tid = ctypes.windll.kernel32.GetCurrentThreadId()
         if not u.RegisterHotKey(None, 1, 0x4000, 0x79):          # MOD_NOREPEAT, VK_F10
             self.ui(self.set_status, "Клавиша F10 занята другой программой. Закройте её и запустите Babelo заново.")
             return
-        msg = wintypes.MSG()
         while u.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
             if msg.message == 0x0312:                             # WM_HOTKEY
-                self.ui(self.on_f10)
+                self.ui(self.on_f10 if msg.wParam == 1 else self.on_esc)
+            elif msg.message == 0x8001:                           # включить Esc (пока идёт перевод)
+                u.RegisterHotKey(None, 2, 0x4000, 0x1B)
+            elif msg.message == 0x8002:                           # вернуть Esc другим программам
+                u.UnregisterHotKey(None, 2)
+
+    def esc_hotkey(self, on):
+        if self.hk_tid:
+            ctypes.windll.user32.PostThreadMessageW(self.hk_tid, 0x8001 if on else 0x8002, 0, 0)
+
+    def on_esc(self):
+        if self.engine is not None:
+            self.stop()
+
+    def banner_idle(self):
+        if self.engine is not None and CFG.get("banner_always"):
+            self.banner.show(HINT)
+        else:
+            self.banner.hide()
 
     def on_f10(self):
         now = time.time()
@@ -1736,7 +1909,9 @@ class App:
         self.engine = Engine(self)
         self.engine.start()
         self.set_status("Перевод включён. F10 — меню, F10 два раза подряд — выключить.")
-        self.subs.flash("Babelo: перевод включён", 2500)
+        self.banner.show(HINT, None if CFG.get("banner_always") else 9000)
+        if CFG.get("esc_stops"):
+            self.esc_hotkey(True)
         self.on_mode_changed()
 
     def stop(self):
@@ -1745,8 +1920,10 @@ class App:
             self.engine = None
         self.muter.restore()
         self.master.set(False)
+        self.esc_hotkey(False)
         self.menu.hide()
         self.subs.hide()
+        self.banner.hide()
         try:
             self.media.play()                                     # не оставляем видео на паузе
         except Exception:
@@ -1873,6 +2050,17 @@ class App:
 
         # те же настройки, что в коротком меню: режимы, субтитры, паузы, повторы, громкость
         self.refresh_controls = add_controls(inner, False, self)
+        self.v_esc = tk.BooleanVar(value=bool(CFG.get("esc_stops", True)))
+        self.v_ban = tk.BooleanVar(value=bool(CFG.get("banner_always", False)))
+
+        def chg2():
+            CFG["esc_stops"] = bool(self.v_esc.get())
+            CFG["banner_always"] = bool(self.v_ban.get())
+            save_settings()
+        ttk.Checkbutton(inner, text="Esc выключает перевод (пока перевод включён, Esc не работает в других программах)",
+                        variable=self.v_esc, command=chg2).pack(anchor="w", padx=12, pady=(8, 0))
+        ttk.Checkbutton(inner, text="Держать подсказку «F10 / Esc» вверху экрана всё время (иначе она видна 9 секунд)",
+                        variable=self.v_ban, command=chg2).pack(anchor="w", padx=12)
 
         # потоки распознавания — только здесь
         lab = ttk.Label(inner, text="")
