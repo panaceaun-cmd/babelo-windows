@@ -4,7 +4,7 @@ Babelo для Windows — живой перевод любого звука, к�
 F10: первое нажатие — перевод включён; ещё раз — выезжает меню; два раза подряд — перевод выключен.
 Распознавание (Whisper) -> перевод (NLLB) -> озвучка (голос Windows или Edge), оригинал заглушается, субтитры белым по чёрному.
 """
-import os, sys, json, time, threading, queue, ctypes, traceback, re, tempfile, math, gc, subprocess
+import os, sys, json, time, threading, queue, ctypes, traceback, re, tempfile, math, gc, subprocess, asyncio, datetime
 
 # программа без консоли: у неё нет stdout/stderr, а библиотеки в них пишут
 if sys.stdout is None:
@@ -31,6 +31,7 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 LOG_FILE = os.path.join(DATA, "babelo.log")
 SETTINGS_FILE = os.path.join(DATA, "settings.json")
 MUTED_FILE = os.path.join(DATA, "muted.json")
+MASTER_FILE = os.path.join(DATA, "master_muted.flag")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 # код языка: (название, код NLLB, основной код языка Windows, голоса Edge)
@@ -56,7 +57,8 @@ WHISPER_SIZES = ["tiny", "base", "small", "medium", "large-v3"]
 TEST_PHRASE = {"ru": "Привет! Это проверка голоса Babelo.", "en": "Hello! This is a Babelo voice test."}
 
 DEFAULTS = {"target": "ru", "source": "auto", "whisper": "small", "phrase_sec": 5, "pause_ms": 400,
-            "speed": 100, "volume": 100, "mute_original": True, "engine": "sapi", "voice": "", "threads": 4, "github_token": ""}
+            "speed": 100, "volume": 100, "mute_original": True, "engine": "sapi", "voice": "", "threads": 4, "github_token": "",
+            "mode": "live", "pause_s": 2, "repeats": 1, "block_sec": 60, "subs": "translated"}
 
 # ---------------------------------------------------------------- журнал и настройки
 LOG_LINES = []
@@ -279,6 +281,7 @@ class ModelHub:
         self.nllb = None
         self.sp = None
         self.lock = threading.Lock()
+        self.rev_cache = {}
 
     @staticmethod
     def whisper_dir(size):
@@ -327,10 +330,28 @@ class ModelHub:
         text = " ".join(s.text.strip() for s in segs).strip()
         return text, info.language
 
-    def translate(self, text, src, tgt):
+    # --- перевод
+    @staticmethod
+    def _sentences(text):
+        return [p for p in re.split(r"(?<=[.!?…。！？])\s+", text) if p.strip()]
+
+    @staticmethod
+    def _words(tokens, skip=0):
+        """Группы индексов токенов по словам (слово начинается с токена «▁»)."""
+        groups = []
+        for i, t in enumerate(tokens):
+            if i < skip:
+                continue
+            if t.startswith("▁") or not groups:
+                groups.append([i])
+            else:
+                groups[-1].append(i)
+        return groups
+
+    def translate_plain(self, text, src, tgt):
         s_code, t_code = LANGS[src][1], LANGS[tgt][1]
         out = []
-        for sent in [p for p in re.split(r"(?<=[.!?…。！？])\s+", text) if p.strip()]:
+        for sent in self._sentences(text):
             toks = [s_code] + self.sp.encode(sent, out_type=str) + ["</s>"]
             res = self.nllb.translate_batch([toks], target_prefix=[[t_code]], beam_size=2, max_decoding_length=200)
             hyp = res[0].hypotheses[0]
@@ -338,6 +359,64 @@ class ModelHub:
                 hyp = hyp[1:]
             out.append(self.sp.decode(hyp))
         return " ".join(out)
+
+    def translate_aligned(self, text, src, tgt):
+        """Перевод + список (слово перевода, слово оригинала) по вниманию модели; слово оригинала может быть None."""
+        s_code, t_code = LANGS[src][1], LANGS[tgt][1]
+        pairs, parts = [], []
+        for sent in self._sentences(text):
+            toks = self.sp.encode(sent, out_type=str)
+            source = [s_code] + toks + ["</s>"]
+            kw = dict(target_prefix=[[t_code]], beam_size=2, max_decoding_length=200)
+            try:
+                res = self.nllb.translate_batch([source], return_attention=True, **kw)
+            except TypeError:
+                res = self.nllb.translate_batch([source], **kw)
+            r = res[0]
+            hyp = list(r.hypotheses[0])
+            skip = 1 if hyp and hyp[0] == t_code else 0
+            att = None
+            try:
+                a = getattr(r, "attention", None)
+                if a:
+                    a = a[0]
+                if a and len(a) in (len(hyp), len(hyp) - skip):
+                    att = a
+            except Exception:
+                att = None
+            offset = len(hyp) - len(att) if att else 0
+            s_groups = self._words(toks)
+            s_words = [self.sp.decode([toks[i] for i in g]).strip() for g in s_groups]
+            tok2word = {}
+            for wi, g in enumerate(s_groups):
+                for i in g:
+                    tok2word[i + 1] = wi                  # +1: в начале стоит код языка
+            for g in self._words(hyp, skip):
+                tw = self.sp.decode([hyp[i] for i in g]).strip()
+                if not tw:
+                    continue
+                ow = None
+                if att:
+                    vec = {}
+                    for i in g:
+                        row = i - offset
+                        if 0 <= row < len(att):
+                            for j, v in enumerate(att[row]):
+                                if j in tok2word:
+                                    vec[j] = vec.get(j, 0.0) + float(v)
+                    if vec:
+                        ow = s_words[tok2word[max(vec, key=vec.get)]]
+                pairs.append((tw, ow))
+            parts.append(self.sp.decode(hyp[skip:]))
+        return " ".join(parts), pairs
+
+    def reverse_word(self, word, src, tgt):
+        """Запасной способ для подсказки: перевести слово субтитров обратно на язык оригинала."""
+        key = (word, src, tgt)
+        if key not in self.rev_cache:
+            w = re.sub(r"^[^\w]+|[^\w]+$", "", word) or word
+            self.rev_cache[key] = self.translate_plain(w, tgt, src).strip(" .!?…")
+        return self.rev_cache[key]
 
 HUB = ModelHub()
 
@@ -371,10 +450,31 @@ def play_mp3(path, volume, stop_evt):
         mci("stop " + alias)
         mci("close " + alias)
 
+def sapi_rate(pct):
+    return max(-10, min(10, round(10 * math.log(max(int(pct), 10) / 100.0, 3))))
+
+def play_mp3_async(path, volume):
+    alias = "bab%d" % (time.time_ns() % 10 ** 9)
+    err, _ = mci('open "%s" type mpegvideo alias %s' % (path, alias))
+    if err:
+        raise RuntimeError("не удалось открыть звук (MCI %d)" % err)
+    mci("setaudio %s volume to %d" % (alias, max(0, min(1000, int(volume) * 10))))
+    mci("play " + alias)
+    return alias
+
+def mp3_playing(alias):
+    _, mode = mci("status %s mode" % alias)
+    return mode == "playing"
+
+def mp3_close(alias):
+    mci("stop " + alias)
+    mci("close " + alias)
+
 class Tts:
-    """Голос Windows (SAPI, офлайн) или Edge (онлайн, качественнее)."""
+    """Голос Windows (SAPI, офлайн) или Edge (онлайн, качественнее). Один объект — на один поток."""
     def __init__(self):
         self.sapi = None
+        self.alias = None
 
     def _sapi(self):
         if self.sapi is None:
@@ -382,15 +482,7 @@ class Tts:
             self.sapi = win32com.client.Dispatch("SAPI.SpVoice")
         return self.sapi
 
-    def speak(self, text, lang, stop_evt):
-        if CFG["engine"] == "edge":
-            try:
-                return self._edge(text, lang, stop_evt)
-            except Exception as e:
-                log("Edge недоступен (%s), говорю голосом Windows" % e)
-        self._sapi_speak(text, lang, stop_evt)
-
-    def _sapi_speak(self, text, lang, stop_evt):
+    def _prepare(self, lang, pct):
         sp = self._sapi()
         voices = sp.GetVoices()
         chosen = None
@@ -415,31 +507,78 @@ class Tts:
                 log("В Windows нет голоса для языка «%s»: Параметры → Время и язык → Речь" % LANGS[lang][0])
         if chosen is not None:
             sp.Voice = chosen
-        sp.Rate = max(-10, min(10, round(10 * math.log(max(int(CFG["speed"]), 10) / 100.0, 3))))
+        sp.Rate = sapi_rate(pct)
         sp.Volume = int(CFG["volume"])
+        return sp
+
+    def edge_file(self, text, lang, pct):
+        import edge_tts
+        names = LANGS[lang][3]
+        voice = CFG.get("voice", "") if CFG.get("voice", "") in names else names[0]
+        path = os.path.join(tempfile.gettempdir(), "babelo_%d.mp3" % time.time_ns())
+        rate = "%+d%%" % max(-50, min(100, int(pct) - 100))
+
+        async def gen():
+            await edge_tts.Communicate(text, voice, rate=rate).save(path)
+        asyncio.run(gen())
+        return path
+
+    def speak(self, text, lang, stop_evt, pct=None):
+        """Говорит и ждёт конца."""
+        pct = int(pct or CFG["speed"])
+        if CFG["engine"] == "edge":
+            try:
+                path = self.edge_file(text, lang, pct)
+                try:
+                    play_mp3(path, int(CFG["volume"]), stop_evt)
+                finally:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+                return
+            except Exception as e:
+                log("Edge недоступен (%s), говорю голосом Windows" % e)
+        sp = self._prepare(lang, pct)
         sp.Speak(text, 1)                                  # асинхронно, ждём сами
         while not sp.WaitUntilDone(80):
             if stop_evt.is_set():
                 sp.Speak("", 3)
                 break
 
-    def _edge(self, text, lang, stop_evt):
-        import asyncio
-        import edge_tts
-        names = LANGS[lang][3]
-        voice = CFG.get("voice", "") if CFG.get("voice", "") in names else names[0]
-        path = os.path.join(tempfile.gettempdir(), "babelo_%d.mp3" % time.time_ns())
+    def say_now(self, text, lang, pct, mp3=None):
+        """Начинает говорить сразу и не ждёт (для режимов с перемоткой видео)."""
+        self.stop_now()
+        if mp3:
+            self.alias = play_mp3_async(mp3, int(CFG["volume"]))
+            return
+        sp = self._prepare(lang, pct)
+        sp.Speak(text, 3)                                  # асинхронно, предыдущую фразу обрезает
 
-        async def gen():
-            await edge_tts.Communicate(text, voice, rate="%+d%%" % (int(CFG["speed"]) - 100)).save(path)
-        asyncio.run(gen())
+    def busy(self):
         try:
-            play_mp3(path, int(CFG["volume"]), stop_evt)
-        finally:
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+            if self.alias:
+                return mp3_playing(self.alias)
+            if self.sapi is not None:
+                return not self.sapi.WaitUntilDone(0)
+        except Exception:
+            pass
+        return False
+
+    def wait_done(self, stop_evt, timeout=30):
+        t0 = time.time()
+        while time.time() - t0 < timeout and not stop_evt.is_set() and self.busy():
+            time.sleep(0.05)
+
+    def stop_now(self):
+        try:
+            if self.alias:
+                mp3_close(self.alias)
+                self.alias = None
+            if self.sapi is not None:
+                self.sapi.Speak("", 3)
+        except Exception:
+            pass
 
 def list_sapi_voices(lang):
     try:
@@ -521,30 +660,198 @@ class Muter:
             return
         self.restore()
 
+# ---------------------------------------------------------------- общая громкость и управление плеером
+class MasterMute:
+    """Выключает звук колонок целиком. Запись звука компьютера (loopback) при этом продолжает всё слышать."""
+    def _endpoint(self):
+        from pycaw.pycaw import AudioUtilities
+        dev = AudioUtilities.GetSpeakers()
+        try:
+            return dev.EndpointVolume                      # новые версии pycaw
+        except Exception:
+            pass
+        from pycaw.pycaw import IAudioEndpointVolume
+        from comtypes import CLSCTX_ALL
+        iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        return ctypes.cast(iface, ctypes.POINTER(IAudioEndpointVolume))
+
+    def set(self, mute):
+        try:
+            ep = self._endpoint()
+            if mute:
+                if ep.GetMute():
+                    return False                           # пользователь сам выключил звук — не трогаем
+                ep.SetMute(1, None)
+                with open(MASTER_FILE, "w") as f:
+                    f.write("1")
+            else:
+                if os.path.exists(MASTER_FILE):
+                    ep.SetMute(0, None)
+                    os.remove(MASTER_FILE)
+            return True
+        except Exception as e:
+            log("общий звук: %s" % e)
+            return False
+
+    def recover(self):
+        if os.path.exists(MASTER_FILE):
+            self.set(False)
+
+class MediaCtl:
+    """Управление плеером Windows (YouTube в Chrome/Edge, Spotify и др.): позиция, пауза, перемотка."""
+    def __init__(self):
+        self.err = ""
+        self.mgr = None
+        self.state = None
+        self.state_t = 0.0
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self.loop.run_forever, daemon=True).start()
+        threading.Thread(target=self._poll, daemon=True).start()
+
+    def _run(self, coro, timeout=3.0):
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
+
+    async def _session(self):
+        from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as M
+        if self.mgr is None:
+            self.mgr = await M.request_async()
+        return self.mgr.get_current_session()
+
+    async def _info(self):
+        from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionPlaybackStatus as PS
+        s = await self._session()
+        if s is None:
+            return None
+        pb = s.get_playback_info()
+        tl = s.get_timeline_properties()
+        playing = pb.playback_status == PS.PLAYING
+        pos = tl.position.total_seconds()
+        rate = float(pb.playback_rate or 1.0)
+        try:
+            if playing:
+                pos += max(0.0, (datetime.datetime.now(datetime.timezone.utc) - tl.last_updated_time).total_seconds()) * rate
+        except Exception:
+            pass
+        seek = bool(pb.controls.is_playback_position_enabled) and tl.end_time.total_seconds() > 0
+        return {"pos": int(pos * 1000), "playing": playing, "seek": seek, "rate": rate}
+
+    def refresh(self):
+        try:
+            self.state = self._run(self._info())
+            self.state_t = time.time()
+            self.err = ""
+        except Exception as e:
+            self.state = None
+            self.err = str(e)[:100]
+
+    def _poll(self):
+        while True:
+            self.refresh()
+            time.sleep(0.25)
+
+    def info(self):
+        return self.state
+
+    def available(self):
+        return self.state is not None
+
+    def can_seek(self):
+        return self.state is not None and self.state["seek"]
+
+    def position_ms(self):
+        st = self.state
+        if st is None:
+            return None
+        pos = st["pos"]
+        if st["playing"]:
+            pos += int((time.time() - self.state_t) * 1000 * st["rate"])
+        return pos
+
+    def _call(self, name, *args):
+        async def go():
+            s = await self._session()
+            if s is None:
+                return False
+            return await getattr(s, name)(*args)
+        try:
+            ok = self._run(go())
+        except Exception as e:
+            log("плеер: %s" % e)
+            ok = False
+        self.refresh()
+        return ok
+
+    def play(self):
+        return self._call("try_play_async")
+
+    def pause(self):
+        return self._call("try_pause_async")
+
+    def seek(self, ms):
+        return self._call("try_change_playback_position_async", int(ms) * 10000)
+
+    def wait_near(self, ms, timeout=3.0):
+        """Ждёт, пока позиция плеера окажется рядом с ms (после перемотки)."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            p = self.position_ms()
+            if p is not None and abs(p - ms) < 2500:
+                return True
+            time.sleep(0.05)
+            self.refresh()
+        return False
+
 # ---------------------------------------------------------------- движок перевода
+def com_init():
+    for mod in ("pythoncom", "comtypes"):
+        try:
+            __import__(mod).CoInitialize()
+        except Exception:
+            pass
+
+class Phrase:
+    def __init__(self, audio, t, prep, start, end):
+        self.audio, self.t, self.prep, self.start, self.end = audio, t, prep, start, end
+
+class Item:
+    """Подготовленная фраза непрерывного перевода: когда она звучит в видео и что сказать."""
+    def __init__(self, start, end, sub, speak, mp3, pct):
+        self.start, self.end, self.sub, self.speak, self.mp3, self.pct = start, end, sub, speak, mp3, pct
+
 class Engine:
     def __init__(self, app):
         self.app = app
         self.stop_evt = threading.Event()
         self.gate = False                  # True: свой голос играет, звук не слушаем
+        self.phase = 0                     # 0 обычный, 1 подготовка блока, 2 показ блока с переводом
         self.phrase_q = queue.Queue()
         self.speak_q = queue.Queue()
         self.hist = []
+        self.items = []
+        self.pending = 0
+        self.plock = threading.Lock()
+        self.loud_prep = 0
         self.stats = {"heard": 0, "recognised": 0, "translated": 0, "spoken": 0, "errors": 0}
         self.last_loud = 0.0
         self.listening = False
 
     def start(self):
-        for fn in (self.capture, self.worker, self.speaker):
+        for fn in (self.capture, self.worker, self.speaker, self.controller):
             threading.Thread(target=fn, daemon=True).start()
 
     def stop(self):
         self.stop_evt.set()
 
+    def wait(self, sec):
+        t0 = time.time()
+        while time.time() - t0 < sec and not self.stop_evt.is_set():
+            time.sleep(0.05)
+
     # --- слушаем звук компьютера (WASAPI loopback) и режем на фразы
     def capture(self):
         p = None
         stream = None
+        media = self.app.media
         try:
             import pyaudiowpatch as pa
             p = pa.PyAudio()
@@ -570,7 +877,7 @@ class Engine:
             stream.start_stream()
             self.listening = True
             log("слушаю: %s (%d Гц, %d кан.)" % (spk["name"], sr, ch))
-            buf, n_samples, silent = [], 0, 0
+            buf, n_samples, silent, start_pos = [], 0, 0, None
             while not self.stop_evt.is_set():
                 try:
                     data = raw_q.get(timeout=0.15)
@@ -588,27 +895,43 @@ class Engine:
                 loud = len(m) > 0 and float(np.abs(m).mean()) > 0.010
                 if loud:
                     self.last_loud = time.time()
+                    if self.phase == 1:
+                        self.loud_prep += 1
+                if loud and not buf:
+                    pos = None if CFG["mode"] == "live" else media.position_ms()
+                    start_pos = None if pos is None else max(0, pos - 150)
                 silent = 0 if loud else silent + 1
                 if loud or buf:
                     buf.append(m)
                     n_samples += len(m)
                 if not buf:
                     continue
-                max_s = int(CFG["phrase_sec"] * 16000)
+                prep = self.phase == 1
+                max_sec = max(int(CFG["phrase_sec"]), 12) if prep else int(CFG["phrase_sec"])
                 pause_frames = max(1, int(CFG["pause_ms"] // 100))
-                if silent < pause_frames and n_samples <= max_s:
+                if silent < pause_frames and n_samples <= max_sec * 16000:
                     continue
                 audio = np.concatenate(buf)
+                trail = silent * 100
                 buf, n_samples, silent = [], 0, 0
                 if len(audio) < 6400:
                     continue
+                end_pos = None
+                if CFG["mode"] != "live":
+                    pos = media.position_ms()
+                    if pos is not None:
+                        end_pos = max(pos - trail + 200, (start_pos or 0) + 500)
                 self.stats["heard"] += 1
-                self.phrase_q.put((audio, time.time()))
-                while self.phrase_q.qsize() > 2:                  # медленный ПК: держим только свежие фразы
-                    try:
-                        self.phrase_q.get_nowait()
-                    except queue.Empty:
-                        break
+                if prep:
+                    with self.plock:
+                        self.pending += 1
+                self.phrase_q.put(Phrase(audio, time.time(), prep, start_pos, end_pos))
+                if CFG["mode"] == "live" and self.phase == 0:
+                    while self.phrase_q.qsize() > 2:              # медленный ПК: держим только свежие фразы
+                        try:
+                            self.phrase_q.get_nowait()
+                        except queue.Empty:
+                            break
         except Exception as e:
             self.app.fail("захват звука", e)
         finally:
@@ -620,31 +943,8 @@ class Engine:
             except Exception:
                 pass
 
-    # --- распознать и перевести
-    def worker(self):
-        try:
-            self.app.ui(self.app.subs.show, "Babelo: загрузка моделей…")
-            HUB.load(CFG["whisper"], int(CFG["threads"]))
-            self.app.ui(self.app.subs.hide)
-        except Exception as e:
-            self.app.fail("загрузка моделей", e)
-            return
-        while not self.stop_evt.is_set():
-            try:
-                audio, t = self.phrase_q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if time.time() - t > 25:
-                continue
-            try:
-                self.process(audio)
-            except Exception as e:
-                self.stats["errors"] += 1
-                log("ошибка фразы: %s" % e)
-                log(traceback.format_exc())
-                self.app.ui(self.app.subs.flash, "⚠ " + str(e)[:80], 3500)
-
-    def process(self, audio):
+    # --- общие шаги: понять фразу и перевести
+    def understand(self, audio):
         secs = len(audio) / 16000.0
         target = CFG["target"]
         forced = None if CFG["source"] == "auto" else CFG["source"]
@@ -657,32 +957,86 @@ class Engine:
         if forced is None:
             self.hist = (self.hist + [det])[-5:]
         if not text:
-            return
+            return None
         if frm == target:
             log("[%s] %s — язык уже целевой" % (frm, text[:60]))
-            return
+            return None
         if len(text) > secs * 25 + 40 or frm not in LANGS:
             log("[%s] «%s» — отброшено (мусор или язык не поддерживается)" % (frm, text[:60]))
-            return
+            return None
         self.stats["recognised"] += 1
-        trc = clean_text(HUB.translate(text, frm, target))[:500]
-        if not any(c.isalpha() for c in trc):
-            return
-        self.stats["translated"] += 1
-        log("[%s→%s] %s → %s" % (frm, target, text[:60], trc[:60]))
-        self.speak_q.put((trc, time.time()))
+        return text, frm
 
-    # --- говорим, пока следующая фраза уже распознаётся
-    def speaker(self):
-        for mod in ("pythoncom", "comtypes"):
+    def make_sub(self, text, frm):
+        target = CFG["target"]
+        tr, pairs = HUB.translate_aligned(text, frm, target)
+        speak = clean_text(tr)[:500]
+        if not any(c.isalpha() for c in speak):
+            return None
+        self.stats["translated"] += 1
+        log("[%s→%s] %s → %s" % (frm, target, text[:60], speak[:60]))
+        return {"orig": text, "tr": tr, "pairs": pairs, "frm": frm, "to": target}, speak
+
+    # --- распознавание и перевод в потоке
+    def worker(self):
+        com_init()
+        tts = Tts()
+        try:
+            self.app.ui(self.app.subs.show, "Babelo: загрузка моделей…")
+            HUB.load(CFG["whisper"], int(CFG["threads"]))
+            self.app.ui(self.app.subs.hide)
+        except Exception as e:
+            self.app.fail("загрузка моделей", e)
+            return
+        notified = False
+        while not self.stop_evt.is_set():
             try:
-                __import__(mod).CoInitialize()
-            except Exception:
-                pass
+                ph = self.phrase_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                if ph.prep:
+                    self.prepare(ph, tts)
+                elif time.time() - ph.t > 25:
+                    pass
+                else:
+                    mode = CFG["mode"]
+                    if mode == "interrupted":
+                        if self.app.media.available():
+                            self.process_interrupted(ph, tts)
+                        else:
+                            if not notified:
+                                notified = True
+                                self.app.ui(self.app.subs.flash, "Прерывистый режим: плеер с управлением не найден, работаю в обычном", 5000)
+                            self.process_live(ph)
+                    elif mode == "live":
+                        self.process_live(ph)
+            except Exception as e:
+                self.stats["errors"] += 1
+                log("ошибка фразы: %s" % e)
+                log(traceback.format_exc())
+                self.app.ui(self.app.subs.flash, "⚠ " + str(e)[:80], 3500)
+            finally:
+                if ph.prep:
+                    with self.plock:
+                        self.pending -= 1
+        tts.stop_now()
+
+    # --- обычный режим: говорим, пока следующая фраза уже распознаётся
+    def process_live(self, ph):
+        res = self.understand(ph.audio)
+        if not res:
+            return
+        made = self.make_sub(*res)
+        if made:
+            self.speak_q.put((made[0], made[1], time.time()))
+
+    def speaker(self):
+        com_init()
         tts = Tts()
         while not self.stop_evt.is_set():
             try:
-                text, t = self.speak_q.get(timeout=0.2)
+                sub, text, t = self.speak_q.get(timeout=0.2)
             except queue.Empty:
                 continue
             if time.time() - t > 20:
@@ -691,7 +1045,7 @@ class Engine:
                 self.gate = True
                 if CFG["mute_original"]:
                     self.app.muter.mute()
-                self.app.ui(self.app.subs.show, text)
+                self.app.ui(self.app.subs.show_sub, sub, "tr")
                 tts.speak(text, CFG["target"], self.stop_evt)
                 self.stats["spoken"] += 1
             except Exception as e:
@@ -703,21 +1057,350 @@ class Engine:
                     self.app.muter.restore()
                     self.app.ui(self.app.subs.hide)
                     time.sleep(0.4)
-                    if self.speak_q.empty():
+                    if self.speak_q.empty() and self.phase == 0:
                         self.gate = False
         self.app.muter.restore()
         self.gate = False
         self.app.ui(self.app.subs.hide)
+        tts.stop_now()
+
+    # --- прерывистый режим: оригинал, потом тот же отрывок с переводом (повторы и паузы настраиваются)
+    def fragment(self, start, end, say, tts, mute_others):
+        media = self.app.media
+        media.seek(start)
+        media.wait_near(start)
+        if mute_others and CFG["mute_original"]:
+            self.app.muter.mute()
+        if say:
+            try:
+                tts.say_now(say[0], CFG["target"], int(CFG["speed"]), say[1])
+            except Exception as e:
+                log("озвучка отрывка: %s" % e)
+        media.play()
+        t0 = time.time()
+        limit = (end - start) / 1000.0 + 4
+        while not self.stop_evt.is_set() and time.time() - t0 < limit:
+            pos = media.position_ms()
+            if pos is not None and pos >= end:
+                break
+            time.sleep(0.03)
+        media.pause()
+        if say:
+            tts.wait_done(self.stop_evt, 40)
+        if mute_others:
+            self.app.muter.restore()
+
+    def process_interrupted(self, ph, tts):
+        media = self.app.media
+        target = CFG["target"]
+        self.gate = True
+        mp3 = None
+        try:
+            media.pause()
+            res = self.understand(ph.audio)
+            if not res:
+                return
+            made = self.make_sub(*res)
+            if not made:
+                return
+            sub, speak = made
+            n = max(1, int(CFG["repeats"]))
+            gap = float(CFG["pause_s"])
+            seek_ok = media.can_seek() and ph.start is not None and ph.end is not None and ph.end > ph.start
+            if CFG["engine"] == "edge":
+                try:
+                    mp3 = tts.edge_file(speak, target, int(CFG["speed"]))
+                except Exception as e:
+                    log("Edge: %s" % e)
+            for i in range(n):
+                if self.stop_evt.is_set():
+                    break
+                if seek_ok and i > 0:                            # оригинал ещё раз
+                    self.app.ui(self.app.subs.show_sub, sub, "orig")
+                    self.fragment(ph.start, ph.end, None, tts, False)
+                self.wait(gap)                                   # пауза между фразой и переводом
+                self.app.ui(self.app.subs.show_sub, sub, "tr")
+                if seek_ok:                                      # тот же отрывок, но с голосом перевода
+                    self.fragment(ph.start, ph.end, (speak, mp3), tts, True)
+                else:                                            # перематывать нельзя: говорим на паузе
+                    if CFG["mute_original"]:
+                        self.app.muter.mute()
+                    tts.speak(speak, target, self.stop_evt)
+                    self.app.muter.restore()
+                self.stats["spoken"] += 1
+                self.wait(gap)
+            self.app.ui(self.app.subs.hide)
+            if seek_ok:
+                media.seek(ph.end)
+        finally:
+            self.app.muter.restore()
+            media.play()
+            if mp3:
+                try:
+                    os.remove(mp3)
+                except Exception:
+                    pass
+            time.sleep(0.4)
+            self.gate = False
+
+    # --- непрерывный режим: блок подгружается вперёд, потом идёт только перевод
+    def prepare(self, ph, tts):
+        res = self.understand(ph.audio)
+        if not res or ph.start is None or ph.end is None:
+            return
+        made = self.make_sub(*res)
+        if not made:
+            return
+        sub, speak = made
+        win = max(1.0, (ph.end - ph.start) / 1000.0)
+        pct = int(min(220, max(int(CFG["speed"]), len(speak) / (13.0 * win) * 100)))   # успеть за окном фразы
+        mp3 = None
+        if CFG["engine"] == "edge":
+            try:
+                mp3 = tts.edge_file(speak, CFG["target"], pct)
+            except Exception as e:
+                log("Edge: %s" % e)
+        self.items.append(Item(ph.start, ph.end, sub, speak, mp3, pct))
+
+    def controller(self):
+        com_init()
+        tts = Tts()
+        while not self.stop_evt.is_set():
+            if CFG["mode"] == "continuous":
+                try:
+                    self.continuous(tts)
+                except Exception as e:
+                    log("непрерывный режим: %s" % e)
+                    log(traceback.format_exc())
+                    CFG["mode"] = "live"
+                    save_settings()
+                    self.app.ui(self.app.sync_ui)
+                    self.app.ui(self.app.subs.flash, "Непрерывный режим остановлен: %s" % str(e)[:80], 5000)
+            else:
+                time.sleep(0.3)
+        tts.stop_now()
+
+    def continuous(self, tts):
+        app = self.app
+        media = app.media
+        st = media.info()
+        if st is None or not st["seek"]:
+            app.ui(app.subs.flash, "Непрерывный режим: нужен плеер с перемоткой (YouTube в Chrome или Edge). "
+                                   "Включён обычный режим.", 6000)
+            CFG["mode"] = "live"
+            save_settings()
+            app.ui(app.sync_ui)
+            return
+        block = int(CFG["block_sec"]) * 1000
+        target = CFG["target"]
+
+        def alive():
+            return not self.stop_evt.is_set() and CFG["mode"] == "continuous"
+        try:
+            while alive():
+                p0 = media.position_ms() or 0
+                # 1. подготовка: блок проигрывается без звука, пока фразы распознаются и переводятся
+                self.items = []
+                self.loud_prep = 0
+                self.gate = False
+                self.phase = 1
+                muted = app.master.set(True)
+                media.play()
+                t0 = time.time()
+                unmuted = False
+                while alive():
+                    pos = media.position_ms() or p0
+                    pct = max(0, min(100, int((pos - p0) * 100 / block)))
+                    app.ui(app.subs.show, "Непрерывный перевод: подготовка %d %%" % pct)
+                    if pos >= p0 + block or time.time() - t0 > block / 1000.0 * 2 + 30:
+                        break
+                    if muted and not unmuted and pos - p0 > 6000 and self.loud_prep == 0:
+                        app.master.set(False)                   # без звука запись ничего не слышит — включаем
+                        unmuted = True
+                    time.sleep(0.3)
+                media.pause()
+                waited = 0
+                while alive() and waited < 480:
+                    with self.plock:
+                        left = self.pending
+                    if left <= 0:
+                        break
+                    app.ui(app.subs.show, "Непрерывный перевод: перевожу, осталось фраз: %d" % left)
+                    time.sleep(0.25)
+                    waited += 1
+                app.master.set(False)
+                if not alive():
+                    break
+                # 2. показ: видео идёт, оригинал выключен, каждая фраза начинается вместе с картинкой
+                items = sorted(self.items, key=lambda it: it.start)
+                self.phase = 2
+                self.gate = True
+                app.muter.mute()
+                media.seek(p0)
+                media.wait_near(p0)
+                media.play()
+                app.ui(app.subs.hide)
+                i, shown = 0, None
+                limit = time.time() + block / 1000.0 * 2 + 30
+                while alive() and time.time() < limit:
+                    pos = media.position_ms()
+                    if pos is None or pos >= p0 + block:
+                        break
+                    while i < len(items) and pos >= items[i].start - 250:
+                        it = items[i]
+                        i += 1
+                        if pos <= it.end:
+                            shown = it
+                            app.ui(app.subs.show_sub, it.sub, "tr")
+                            try:
+                                tts.say_now(it.speak, target, it.pct, it.mp3)
+                            except Exception as e:
+                                log("озвучка: %s" % e)
+                    if shown is not None and pos > shown.end + 300:
+                        app.ui(app.subs.hide)
+                        shown = None
+                    time.sleep(0.03)
+                tts.stop_now()
+                app.muter.restore()
+                app.ui(app.subs.hide)
+                self.stats["spoken"] += len(items)
+                for it in items:
+                    if it.mp3:
+                        try:
+                            os.remove(it.mp3)
+                        except Exception:
+                            pass
+        finally:
+            app.master.set(False)
+            app.muter.restore()
+            tts.stop_now()
+            self.phase = 0
+            self.gate = False
+            media.play()
 
 # ---------------------------------------------------------------- окна
+import tkinter.font as tkfont
+
 BG = "#1c1c20"
+MODES = [("live", "Обычный (по ходу)"),
+         ("continuous", "Непрерывный: сначала подгрузка, потом только перевод"),
+         ("interrupted", "Прерывистый: оригинал, потом тот же отрывок с переводом")]
+SUBS = [("off", "Не показывать субтитры"), ("translated", "Переведённые субтитры"),
+        ("original", "Субтитры на языке оригинала"), ("both", "Перевод и оригинал вместе")]
+
+def label_of(pairs, key):
+    return next((t for k, t in pairs if k == key), pairs[0][1])
+
+def key_of(pairs, text):
+    return next((k for k, t in pairs if t == text), pairs[0][0])
+
+def make_scroll(parent, bg=None):
+    """Прокручиваемая область: всё содержимое доступно колёсиком мыши, даже на маленьком экране."""
+    kw = {"bg": bg} if bg else {}
+    outer = tk.Frame(parent, **kw)
+    canvas = tk.Canvas(outer, highlightthickness=0, **kw)
+    sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    inner = tk.Frame(canvas, **kw)
+    win = canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=sb.set)
+    inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
+
+    def wheel(e):
+        canvas.yview_scroll(int(-e.delta / 120), "units")
+    canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", wheel))
+    canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+    sb.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    return outer, inner, canvas
+
+def add_slider(parent, dark, title, lo, hi, key):
+    kw = dict(bg=BG, fg="white") if dark else {}
+    lbl = tk.Label(parent, text="", anchor="w", justify="left", **kw)
+    lbl.pack(fill="x", padx=12, pady=(6, 0))
+
+    def upd(v):
+        CFG[key] = int(float(v))
+        lbl.config(text="%s: %d" % (title, CFG[key]))
+    skw = dict(bg=BG, fg="white", troughcolor="#444", highlightthickness=0) if dark else {}
+    sc = tk.Scale(parent, from_=lo, to=hi, orient="horizontal", showvalue=False, command=upd, sliderlength=18,
+                  width=12, **skw)
+    sc.set(int(CFG[key]))
+    sc.bind("<ButtonRelease-1>", lambda e: save_settings())
+    sc.pack(fill="x", padx=12)
+    upd(CFG[key])
+    return lambda: sc.set(int(CFG[key]))
+
+def add_controls(parent, dark, app):
+    """Общий набор настроек для короткого и для главного меню. Возвращает функцию «обновить из настроек»."""
+    kw = dict(bg=BG, fg="white") if dark else {}
+    refresh = []
+
+    def lab(text):
+        tk.Label(parent, text=text, anchor="w", justify="left", **kw).pack(fill="x", padx=12, pady=(8, 0))
+
+    lab("Режим перевода")
+    cm = ttk.Combobox(parent, state="readonly", values=[t for _, t in MODES])
+    cm.pack(fill="x", padx=12)
+
+    def pick_mode(_=None):
+        CFG["mode"] = key_of(MODES, cm.get())
+        save_settings()
+        app.on_mode_changed()
+    cm.bind("<<ComboboxSelected>>", pick_mode)
+    refresh.append(lambda: cm.set(label_of(MODES, CFG["mode"])))
+
+    var = tk.BooleanVar()
+    ckw = dict(selectcolor="#333", activebackground=BG, activeforeground="white", **kw) if dark else {}
+
+    def chg():
+        CFG["mute_original"] = bool(var.get())
+        save_settings()
+    tk.Checkbutton(parent, text="Заглушать оригинал на время перевода", variable=var, command=chg, anchor="w",
+                   **ckw).pack(fill="x", padx=8, pady=(8, 0))
+    refresh.append(lambda: var.set(bool(CFG["mute_original"])))
+
+    lab("Субтитры")
+    cs = ttk.Combobox(parent, state="readonly", values=[t for _, t in SUBS])
+    cs.pack(fill="x", padx=12)
+
+    def pick_subs(_=None):
+        CFG["subs"] = key_of(SUBS, cs.get())
+        save_settings()
+    cs.bind("<<ComboboxSelected>>", pick_subs)
+    refresh.append(lambda: cs.set(label_of(SUBS, CFG["subs"])))
+
+    refresh.append(add_slider(parent, dark, "Прерывистый: пауза между фразой и переводом, с", 0, 10, "pause_s"))
+    refresh.append(add_slider(parent, dark, "Прерывистый: сколько раз повторить (оригинал и перевод)", 1, 10, "repeats"))
+    refresh.append(add_slider(parent, dark, "Непрерывный: длина блока подгрузки вперёд, с", 20, 180, "block_sec"))
+    refresh.append(add_slider(parent, dark, "Слушать фразу не дольше, с", 2, 15, "phrase_sec"))
+    refresh.append(add_slider(parent, dark, "Пауза конца фразы, мс", 200, 1000, "pause_ms"))
+    refresh.append(add_slider(parent, dark, "Скорость озвучки, %", 70, 150, "speed"))
+    refresh.append(add_slider(parent, dark, "Громкость перевода, %", 10, 100, "volume"))
+    for r in refresh:
+        r()
+    return lambda: [r() for r in refresh]
+
+def exstyle(win, clickthrough):
+    """Окно без фокуса; clickthrough=True — мышь проходит сквозь него."""
+    try:
+        u = ctypes.windll.user32
+        hwnd = u.GetParent(win.winfo_id()) or win.winfo_id()
+        style = u.GetWindowLongW(hwnd, -20) | 0x80 | 0x08000000
+        style = (style | 0x20) if clickthrough else (style & ~0x20)
+        u.SetWindowLongW(hwnd, -20, style)
+    except Exception:
+        pass
 
 class Subtitles:
-    """Субтитры внизу экрана: белые буквы на чёрном, мышь проходит сквозь них."""
+    """Субтитры внизу экрана: белое на чёрном. Наведите мышь на слово перевода — сверху появится слово оригинала жёлтым."""
     def __init__(self, root):
         self.root = root
         self.win = None
-        self.lbl = None
+        self.holder = None
+        self.tip = None
+        self.tip_lbl = None
+        self.cur = None
         self.job = None
 
     def _ensure(self):
@@ -728,38 +1411,147 @@ class Subtitles:
         w.attributes("-topmost", True)
         w.attributes("-alpha", 0.97)
         w.configure(bg="black")
-        sw = w.winfo_screenwidth()
-        self.lbl = tk.Label(w, text="", fg="white", bg="black", font=("Segoe UI", 22, "bold"),
-                            wraplength=int(sw * 0.8), justify="center", padx=28, pady=14)
-        self.lbl.pack()
+        self.holder = tk.Frame(w, bg="black")
+        self.holder.pack(padx=28, pady=12)
         w.withdraw()
         w.update_idletasks()
-        try:
-            u = ctypes.windll.user32
-            hwnd = u.GetParent(w.winfo_id()) or w.winfo_id()
-            style = u.GetWindowLongW(hwnd, -20)
-            u.SetWindowLongW(hwnd, -20, style | 0x20 | 0x80 | 0x08000000)   # click-through, tool window, no activate
-        except Exception:
-            pass
         self.win = w
 
-    def show(self, text):
+    def _begin(self):
         self._ensure()
         if self.job:
             self.root.after_cancel(self.job)
             self.job = None
-        self.lbl.config(text=text)
+        self._hide_tip()
+        for c in self.holder.winfo_children():
+            c.destroy()
+
+    def _place(self, hover):
+        exstyle(self.win, not hover)
         self.win.update_idletasks()
-        w, h = self.lbl.winfo_reqwidth(), self.lbl.winfo_reqheight()
+        w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
         sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
-        self.win.geometry("%dx%d+%d+%d" % (w, h, (sw - w) // 2, sh - h - 90))
+        self.win.geometry("%dx%d+%d+%d" % (w, h, max(0, (sw - w) // 2), max(0, sh - h - 90)))
         self.win.deiconify()
         self.win.lift()
+
+    def show(self, text):
+        self._begin()
+        sw = self.win.winfo_screenwidth()
+        tk.Label(self.holder, text=text, fg="white", bg="black", font=("Segoe UI", 22, "bold"),
+                 wraplength=int(sw * 0.8), justify="center").pack()
+        self._place(False)
+
+    def show_sub(self, sub, kind="tr"):
+        mode = CFG.get("subs", "translated")
+        if kind == "orig":
+            lines = ["orig"] if mode in ("original", "both") else []
+        else:
+            lines = {"translated": ["tr"], "original": ["orig"], "both": ["orig", "tr"]}.get(mode, [])
+        if not lines:
+            self.hide()
+            return
+        self._begin()
+        maxw = int(self.win.winfo_screenwidth() * 0.8)
+        hover = False
+        for ln in lines:
+            if ln == "orig":
+                two = len(lines) > 1
+                tk.Label(self.holder, text=sub["orig"], fg="#dddddd" if two else "white", bg="black",
+                         font=("Segoe UI", 18 if two else 22, "bold"), wraplength=maxw, justify="center").pack()
+            elif sub.get("pairs"):
+                self._flow(sub, maxw)
+                hover = True
+            else:
+                tk.Label(self.holder, text=sub["tr"], fg="white", bg="black", font=("Segoe UI", 22, "bold"),
+                         wraplength=maxw, justify="center").pack()
+        self._place(hover)
+
+    def _flow(self, sub, maxw):
+        font = ("Segoe UI", 22, "bold")
+        f = tkfont.Font(font=font)
+        line, used = None, 0
+        for tw, ow in sub["pairs"]:
+            w = f.measure(tw + " ")
+            if line is None or used + w > maxw:
+                line = tk.Frame(self.holder, bg="black")
+                line.pack(anchor="center")
+                used = 0
+            lbl = tk.Label(line, text=tw + " ", font=font, fg="white", bg="black", padx=0, pady=2)
+            lbl.pack(side="left")
+            lbl.bind("<Enter>", lambda e, l=lbl, o=ow, t=tw: self._enter(l, o, t, sub))
+            lbl.bind("<Leave>", lambda e, l=lbl: self._leave(l))
+            used += w
+
+    def _enter(self, lbl, ow, tw, sub):
+        try:
+            lbl.config(bg="#333333")
+        except tk.TclError:
+            return
+        self.cur = lbl
+        if ow:
+            self._tip(lbl, ow)
+            return
+
+        def work():                                          # слова нет в выравнивании: переводим слово обратно
+            try:
+                w = HUB.reverse_word(tw, sub["to"], sub["frm"])
+            except Exception:
+                w = ""
+            if w:
+                self.root.after(0, lambda: self._tip(lbl, w))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _leave(self, lbl):
+        try:
+            lbl.config(bg="black")
+        except tk.TclError:
+            pass
+        if self.cur is lbl:
+            self.cur = None
+        self._hide_tip()
+
+    def _tip(self, lbl, text):
+        if self.cur is not lbl:
+            return
+        try:
+            if self.tip is None:
+                t = tk.Toplevel(self.root)
+                t.overrideredirect(True)
+                t.attributes("-topmost", True)
+                t.attributes("-alpha", 0.97)
+                t.configure(bg="black")
+                self.tip_lbl = tk.Label(t, text="", fg="#ffd400", bg="black", font=("Segoe UI", 22, "bold"), padx=14, pady=6)
+                self.tip_lbl.pack()
+                t.withdraw()
+                t.update_idletasks()
+                exstyle(t, True)
+                self.tip = t
+            self.tip_lbl.config(text=text)
+            self.tip.update_idletasks()
+            tw, th = self.tip.winfo_reqwidth(), self.tip.winfo_reqheight()
+            sw = self.tip.winfo_screenwidth()
+            x = min(max(0, lbl.winfo_rootx() + lbl.winfo_width() // 2 - tw // 2), sw - tw)
+            y = max(0, self.win.winfo_rooty() - th - 8)
+            self.tip.geometry("%dx%d+%d+%d" % (tw, th, x, y))
+            self.tip.deiconify()
+            self.tip.lift()
+        except tk.TclError:
+            pass
+
+    def _hide_tip(self):
+        if self.tip is not None:
+            try:
+                self.tip.withdraw()
+            except tk.TclError:
+                pass
 
     def hide(self):
         if self.job:
             self.root.after_cancel(self.job)
             self.job = None
+        self.cur = None
+        self._hide_tip()
         if self.win is not None:
             self.win.withdraw()
 
@@ -768,8 +1560,8 @@ class Subtitles:
         self.job = self.root.after(ms, self.hide)
 
 class Menu:
-    """Короткое меню, выезжающее справа."""
-    W = 340
+    """Короткое меню, выезжающее справа. Заголовок и нижние кнопки всегда видны, середина прокручивается."""
+    W = 390
 
     def __init__(self, app):
         self.app = app
@@ -782,52 +1574,30 @@ class Menu:
     def toggle(self):
         self.hide() if self.shown else self.show()
 
-    def _slider(self, parent, title, lo, hi, key):
-        lbl = tk.Label(parent, text="", fg="white", bg=BG, anchor="w")
-        lbl.pack(fill="x", padx=14, pady=(8, 0))
-
-        def upd(v):
-            CFG[key] = int(float(v))
-            lbl.config(text="%s: %d" % (title, CFG[key]))
-        sc = tk.Scale(parent, from_=lo, to=hi, orient="horizontal", showvalue=False, command=upd, bg=BG, fg="white",
-                      troughcolor="#444", highlightthickness=0, length=self.W - 28)
-        sc.set(int(CFG[key]))
-        sc.bind("<ButtonRelease-1>", lambda e: save_settings())
-        sc.pack(padx=14)
-        upd(CFG[key])
-
     def show(self):
         if self.win is not None:
             return
-        root = self.app.root
-        w = tk.Toplevel(root)
+        w = tk.Toplevel(self.app.root)
         w.overrideredirect(True)
         w.attributes("-topmost", True)
         w.configure(bg=BG)
         hdr = tk.Frame(w, bg=BG)
-        hdr.pack(fill="x", padx=14, pady=(12, 2))
+        hdr.pack(side="top", fill="x", padx=14, pady=(10, 2))
         tk.Label(hdr, text="Babelo — перевод идёт", fg="white", bg=BG, font=("Segoe UI", 12, "bold")).pack(side="left")
         tk.Button(hdr, text="✕", fg="white", bg=BG, bd=0, font=("Segoe UI", 14), activebackground="#333",
                   activeforeground="white", command=self.hide).pack(side="right")
-        self._slider(w, "Слушать фразу, с", 2, 15, "phrase_sec")
-        self._slider(w, "Пауза конца фразы, мс", 200, 1000, "pause_ms")
-        self._slider(w, "Скорость озвучки, %", 70, 150, "speed")
-        self._slider(w, "Громкость перевода, %", 10, 100, "volume")
-        var = tk.BooleanVar(value=bool(CFG["mute_original"]))
-        w._var = var
-
-        def chg():
-            CFG["mute_original"] = bool(var.get())
-            save_settings()
-        tk.Checkbutton(w, text="Заглушать оригинал на время перевода", variable=var, command=chg, fg="white", bg=BG,
-                       selectcolor="#333", activebackground=BG, activeforeground="white").pack(anchor="w", padx=10, pady=6)
+        foot = tk.Frame(w, bg=BG)
+        foot.pack(side="bottom", fill="x", padx=14, pady=(4, 10))
         for text, cmd in (("Все настройки", self.app.show_main), ("Полное закрытие программы", self.app.full_close)):
-            tk.Button(w, text=text, command=cmd, bg="#333", fg="white", activebackground="#444",
-                      activeforeground="white", relief="flat", pady=6).pack(fill="x", padx=14, pady=4)
+            tk.Button(foot, text=text, command=cmd, bg="#333", fg="white", activebackground="#444",
+                      activeforeground="white", relief="flat", pady=5).pack(fill="x", pady=2)
+        outer, inner, canvas = make_scroll(w, bg=BG)
+        outer.pack(side="top", fill="both", expand=True)
+        add_controls(inner, True, self.app)
         w.update_idletasks()
-        h = w.winfo_reqheight()
         sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
-        y = max(20, (sh - h) // 2)
+        h = min(inner.winfo_reqheight() + 120, sh - 80)
+        y = max(10, (sh - h) // 2)
         self.win = w
         self._anim(w, sw, sw - self.W, y, h, 0, None)
 
@@ -868,13 +1638,17 @@ class App:
             pass
         self.root = tk.Tk()
         self.root.title("Babelo for Windows — сборка %d" % APP_BUILD)
-        self.root.geometry("640x720")
+        sh = self.root.winfo_screenheight()
+        self.root.geometry("780x%d" % min(980, sh - 90))
         self.events = queue.Queue()
         self.engine = None
         self.last_f10 = 0.0
         self.release_job = None
         self.muter = Muter()
         self.muter.recover()
+        self.master = MasterMute()
+        self.master.recover()
+        self.media = MediaCtl()
         self.subs = Subtitles(self.root)
         self.menu = Menu(self)
         self.hidden_note = False
@@ -882,10 +1656,11 @@ class App:
         self.dl_cancel = threading.Event()
         self.dl_thread = None
         self.pending_update = None
+        self.refresh_controls = lambda: None
         self._build_main()
         self.refresh_models_state()
         self.root.after(1000, self._tick)
-        self.root.after(4000, lambda: self.check_updates(True))      # тихая проверка при запуске
+        self.root.after(4000, lambda: self.check_updates(True))      # тихая проверка обновлений при запуске
         self.root.protocol("WM_DELETE_WINDOW", self.hide_main)
         threading.Thread(target=self._hotkey, daemon=True).start()
         self.root.after(50, self._poll)
@@ -939,6 +1714,17 @@ class App:
         else:
             self.menu.toggle()
 
+    def on_mode_changed(self):
+        if CFG["mode"] != "live" and not self.media.available():
+            self.subs.flash("Для этого режима нужен плеер Windows с управлением (YouTube в Chrome или Edge). "
+                            "Сейчас такой плеер не найден — включите видео.", 6000)
+
+    def sync_ui(self):
+        try:
+            self.refresh_controls()
+        except Exception:
+            pass
+
     def start(self):
         if not HUB.ready(CFG["whisper"]):
             self.show_main()
@@ -951,14 +1737,20 @@ class App:
         self.engine.start()
         self.set_status("Перевод включён. F10 — меню, F10 два раза подряд — выключить.")
         self.subs.flash("Babelo: перевод включён", 2500)
+        self.on_mode_changed()
 
     def stop(self):
         if self.engine is not None:
             self.engine.stop()
             self.engine = None
         self.muter.restore()
+        self.master.set(False)
         self.menu.hide()
         self.subs.hide()
+        try:
+            self.media.play()                                     # не оставляем видео на паузе
+        except Exception:
+            pass
         self.set_status("Перевод выключен. F10 — включить.")
         self.release_job = self.root.after(180000, HUB.release)    # освободить память через 3 минуты
 
@@ -976,6 +1768,7 @@ class App:
         try:
             self.stop()
             self.muter.restore()
+            self.master.set(False)
             self.subs.hide()
             self.root.destroy()
         finally:
@@ -990,6 +1783,7 @@ class App:
                                           "Полностью закрыть: кнопка «Полное закрытие программы» (в окне или в меню).")
 
     def show_main(self):
+        self.sync_ui()
         self.root.deiconify()
         self.root.lift()
 
@@ -999,12 +1793,20 @@ class App:
 
     def _build_main(self):
         r = self.root
-        pad = {"padx": 10, "pady": 4}
-        self.status = tk.Label(r, text="Нажмите F10, когда модели скачаны.", anchor="w", justify="left", wraplength=600,
-                               font=("Segoe UI", 10, "bold"))
-        self.status.pack(fill="x", **pad)
-        f = ttk.Frame(r)
-        f.pack(fill="x", **pad)
+        top = tk.Frame(r)
+        top.pack(side="top", fill="x", padx=10, pady=6)
+        self.status = tk.Label(top, text="Нажмите F10, когда модели скачаны.", anchor="w", justify="left",
+                               wraplength=520, font=("Segoe UI", 10, "bold"))
+        self.status.pack(side="left", fill="x", expand=True)
+        ttk.Button(top, text="Полное закрытие программы", command=self.full_close).pack(side="right", padx=4)
+        ttk.Label(r, text="F10: включить · ещё раз: меню · два раза подряд: выключить").pack(side="bottom", pady=3)
+        self.logbox = tk.Text(r, height=7, state="disabled", bg="#111", fg="#ddd", font=("Consolas", 9))
+        self.logbox.pack(side="bottom", fill="x", padx=10, pady=4)
+        outer, inner, canvas = make_scroll(r)
+        outer.pack(side="top", fill="both", expand=True)
+
+        f = ttk.Frame(inner)
+        f.pack(fill="x", padx=10, pady=4)
         names = [LANGS[c][0] for c in LANGS]
         codes = list(LANGS)
         self.v_src = tk.StringVar(value="Авто" if CFG["source"] == "auto" else LANGS.get(CFG["source"], ("Авто",))[0])
@@ -1069,42 +1871,33 @@ class App:
         self.cv.bind("<<ComboboxSelected>>", pick_voice)
         fill_voices()
 
-        for title, lo, hi, key in (("Слушать фразу не дольше, с", 2, 15, "phrase_sec"),
-                                   ("Пауза конца фразы, мс", 200, 1000, "pause_ms"),
-                                   ("Скорость озвучки, %", 70, 150, "speed"),
-                                   ("Громкость перевода, %", 10, 100, "volume"),
-                                   ("Потоки распознавания (больше — быстрее, но тяжелее)", 2, 12, "threads")):
-            lab = ttk.Label(r, text="")
-            lab.pack(anchor="w", padx=10)
+        # те же настройки, что в коротком меню: режимы, субтитры, паузы, повторы, громкость
+        self.refresh_controls = add_controls(inner, False, self)
 
-            def mk(lab=lab, title=title, key=key):
-                def upd(v):
-                    CFG[key] = int(float(v))
-                    lab.config(text="%s: %d" % (title, CFG[key]))
-                return upd
-            sc = ttk.Scale(r, from_=lo, to=hi, orient="horizontal", command=mk())
-            sc.set(int(CFG[key]))
-            sc.bind("<ButtonRelease-1>", lambda e: save_settings())
-            sc.pack(fill="x", padx=10)
-            mk()(CFG[key])
-        self.v_mute = tk.BooleanVar(value=bool(CFG["mute_original"]))
+        # потоки распознавания — только здесь
+        lab = ttk.Label(inner, text="")
+        lab.pack(anchor="w", padx=12, pady=(8, 0))
 
-        def chg():
-            CFG["mute_original"] = bool(self.v_mute.get())
-            save_settings()
-        ttk.Checkbutton(r, text="Заглушать оригинал на время перевода", variable=self.v_mute, command=chg).pack(anchor="w", **pad)
+        def upd(v):
+            CFG["threads"] = int(float(v))
+            lab.config(text="Потоки распознавания (больше — быстрее, но тяжелее): %d" % CFG["threads"])
+        sc = ttk.Scale(inner, from_=2, to=12, orient="horizontal", command=upd)
+        sc.set(int(CFG["threads"]))
+        sc.bind("<ButtonRelease-1>", lambda e: save_settings())
+        sc.pack(fill="x", padx=12)
+        upd(CFG["threads"])
 
-        self.models_lbl = ttk.Label(r, text="", font=("Segoe UI", 9, "bold"))
-        self.models_lbl.pack(anchor="w", padx=10)
-        self.dl_label = ttk.Label(r, text="Загрузка не идёт.", wraplength=600)
-        self.dl_label.pack(anchor="w", padx=10)
-        self.dl_bar = ttk.Progressbar(r, maximum=100)
-        self.dl_bar.pack(fill="x", padx=10, pady=2)
-        self.stats_lbl = ttk.Label(r, text="Перевод выключен.", wraplength=600)
-        self.stats_lbl.pack(anchor="w", padx=10, pady=2)
-        tkf = ttk.Frame(r)
-        tkf.pack(fill="x", padx=10)
-        ttk.Label(tkf, text="Токен GitHub (нужен только если репозиторий закрытый):").pack(side="left")
+        self.models_lbl = ttk.Label(inner, text="", font=("Segoe UI", 9, "bold"))
+        self.models_lbl.pack(anchor="w", padx=12, pady=(10, 0))
+        self.dl_label = ttk.Label(inner, text="Загрузка не идёт.", wraplength=640)
+        self.dl_label.pack(anchor="w", padx=12)
+        self.dl_bar = ttk.Progressbar(inner, maximum=100)
+        self.dl_bar.pack(fill="x", padx=12, pady=2)
+        self.stats_lbl = ttk.Label(inner, text="Перевод выключен.", wraplength=640)
+        self.stats_lbl.pack(anchor="w", padx=12, pady=2)
+        tkf = ttk.Frame(inner)
+        tkf.pack(fill="x", padx=12, pady=2)
+        ttk.Label(tkf, text="Токен GitHub (нужен только для закрытого репозитория):").pack(side="left")
         self.v_token = tk.StringVar(value=str(CFG.get("github_token", "")))
         te = ttk.Entry(tkf, textvariable=self.v_token, show="•", width=22)
         te.pack(side="left", padx=6)
@@ -1113,17 +1906,13 @@ class App:
             CFG["github_token"] = self.v_token.get().strip()
             save_settings()
         te.bind("<FocusOut>", save_token)
-        bar = ttk.Frame(r)
-        bar.pack(fill="x", **pad)
+        bar = ttk.Frame(inner)
+        bar.pack(fill="x", padx=8, pady=8)
         ttk.Button(bar, text="Скачать модели", command=self.download).pack(side="left", padx=4)
         ttk.Button(bar, text="Отмена загрузки", command=lambda: self.dl_cancel.set()).pack(side="left", padx=4)
         self.btn_update = ttk.Button(bar, text="Проверить обновления", command=self.on_update_btn)
         self.btn_update.pack(side="left", padx=4)
         ttk.Button(bar, text="Проверить голос", command=self.test_voice).pack(side="left", padx=4)
-        ttk.Button(bar, text="Полное закрытие программы", command=self.full_close).pack(side="right", padx=4)
-        self.logbox = tk.Text(r, height=12, state="disabled", bg="#111", fg="#ddd", font=("Consolas", 9))
-        self.logbox.pack(fill="both", expand=True, **pad)
-        ttk.Label(r, text="F10: включить · ещё раз: меню · два раза подряд: выключить").pack(pady=4)
 
     def refresh_models_state(self):
         w = os.path.exists(os.path.join(HUB.whisper_dir(CFG["whisper"]), "model.bin"))
@@ -1227,6 +2016,7 @@ class App:
             return
         self.set_status("Устанавливаю обновление… программа закроется и откроется заново сама.")
         self.muter.restore()
+        self.master.set(False)
         self.root.after(600, lambda: os._exit(0))
 
     def _tick(self):
@@ -1239,18 +2029,15 @@ class App:
             else:
                 sound = "звук идёт" if time.time() - e.last_loud < 2 else "тихо (включите видео или музыку)"
             s = e.stats
-            txt = "Перевод включён · слышу: %s · фраз услышано %d, распознано %d, переведено %d, озвучено %d, ошибок %d" % (
-                sound, s["heard"], s["recognised"], s["translated"], s["spoken"], s["errors"])
+            player = "плеер найден" if self.media.available() else "плеер не найден"
+            txt = "Перевод включён · слышу: %s · %s · фраз услышано %d, распознано %d, переведено %d, озвучено %d, ошибок %d" % (
+                sound, player, s["heard"], s["recognised"], s["translated"], s["spoken"], s["errors"])
         self.stats_lbl.config(text=txt)
         self.root.after(1000, self._tick)
 
     def test_voice(self):
         def run():
-            for mod in ("pythoncom", "comtypes"):
-                try:
-                    __import__(mod).CoInitialize()
-                except Exception:
-                    pass
+            com_init()
             try:
                 Tts().speak(TEST_PHRASE.get(CFG["target"], TEST_PHRASE["en"]), CFG["target"], threading.Event())
                 self.ui(self.set_status, "Проверка голоса выполнена. Вы слышали голос?")
@@ -1277,3 +2064,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

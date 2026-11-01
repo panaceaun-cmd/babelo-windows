@@ -10,4 +10,5 @@ comtypes
 psutil
 pywin32
 edge-tts
+winsdk
 pyinstaller
