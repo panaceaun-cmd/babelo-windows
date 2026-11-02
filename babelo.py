@@ -59,7 +59,7 @@ TEST_PHRASE = {"ru": "Привет! Это проверка голоса Babelo.
 DEFAULTS = {"target": "ru", "source": "auto", "whisper": "small", "phrase_sec": 5, "pause_ms": 400,
             "speed": 100, "volume": 100, "mute_original": True, "engine": "sapi", "voice": "", "threads": 4, "github_token": "",
             "mode": "live", "pause_s": 2, "repeats": 1, "block_sec": 60, "subs": "translated",
-            "esc_stops": True, "banner_always": False}
+            "esc_stops": True}
 
 # ---------------------------------------------------------------- журнал и настройки
 LOG_LINES = []
@@ -814,6 +814,14 @@ class Phrase:
     def __init__(self, audio, t, prep, start, end):
         self.audio, self.t, self.prep, self.start, self.end = audio, t, prep, start, end
 
+class AnyEvent:
+    """Событие «остановить»: срабатывает, если сработало любое из переданных."""
+    def __init__(self, *evts):
+        self.evts = evts
+
+    def is_set(self):
+        return any(e.is_set() for e in self.evts)
+
 class Restart(Exception):
     """Видео обновили, запустили заново или перемотали: подгрузка начинается с нового места."""
 
@@ -841,9 +849,12 @@ class Engine:
         self.guard_until = 0.0             # до этого момента свои команды плееру не считаем действиями пользователя
         self.spoken = set()
         self.silent_prep = False
+        self.hold = threading.Event()      # видео поставил на паузу пользователь: перевод ждёт
+        self.halt = AnyEvent(self.stop_evt, self.hold)
+        self.autoplay = True               # при включении перевода видео запускается само (один раз)
 
     def start(self):
-        for fn in (self.capture, self.worker, self.speaker, self.controller):
+        for fn in (self.capture, self.worker, self.speaker, self.controller, self.pause_watch):
             threading.Thread(target=fn, daemon=True).start()
 
     def stop(self):
@@ -851,8 +862,40 @@ class Engine:
 
     def wait(self, sec):
         t0 = time.time()
-        while time.time() - t0 < sec and not self.stop_evt.is_set():
+        while time.time() - t0 < sec and not self.halt.is_set():
             time.sleep(0.05)
+
+    # --- пауза пользователя: перевод останавливается и ждёт, пока видео не включат снова
+    def clear_queues(self):
+        for q in (self.phrase_q, self.speak_q):
+            try:
+                while True:
+                    q.get_nowait()
+            except queue.Empty:
+                pass
+
+    def pause_watch(self):
+        com_init()
+        media = self.app.media
+        was = None
+        while not self.stop_evt.is_set():
+            st = media.info()
+            if st is not None:
+                playing = st["playing"]
+                if was is True and not playing and time.time() >= self.guard_until and not self.hold.is_set():
+                    self.hold.set()                                   # пользователь поставил видео на паузу
+                    self.clear_queues()
+                    self.app.muter.restore()
+                    self.app.master.set(False)
+                    self.app.ui(self.app.subs.hide)
+                    self.app.ui(self.app.banner.status, "Видео на паузе — перевод ждёт. Включите воспроизведение, и перевод продолжится.")
+                    log("пользователь поставил видео на паузу — перевод ждёт")
+                elif was is False and playing and self.hold.is_set():
+                    self.hold.clear()                                 # пользователь продолжил просмотр
+                    self.app.ui(self.app.banner.status, None)
+                    log("видео снова идёт — перевод продолжается")
+                was = playing
+            time.sleep(0.12)
 
     # --- слушаем звук компьютера (WASAPI loopback) и режем на фразы
     def capture(self):
@@ -896,7 +939,7 @@ class Engine:
                     a = np.frombuffer(data, dtype=np.int16)
                     a = a[: len(a) // ch * ch].reshape(-1, ch).astype(np.float32) / 32768.0
                     m = to16k(a.mean(axis=1), sr)
-                if self.gate:
+                if self.gate or self.hold.is_set():
                     buf, n_samples, silent = [], 0, 0
                     continue
                 loud = len(m) > 0 and float(np.abs(m).mean()) > 0.010
@@ -1002,7 +1045,9 @@ class Engine:
             except queue.Empty:
                 continue
             try:
-                if ph.prep:
+                if self.hold.is_set():
+                    pass
+                elif ph.prep:
                     self.prepare(ph, tts)
                 elif time.time() - ph.t > 25:
                     pass
@@ -1046,14 +1091,14 @@ class Engine:
                 sub, text, t = self.speak_q.get(timeout=0.2)
             except queue.Empty:
                 continue
-            if time.time() - t > 20:
+            if time.time() - t > 20 or self.hold.is_set():
                 continue
             try:
                 self.gate = True
                 if CFG["mute_original"]:
                     self.app.muter.mute()
                 self.app.ui(self.app.subs.show_sub, sub, "tr")
-                tts.speak(text, CFG["target"], self.stop_evt)
+                tts.speak(text, CFG["target"], self.halt)
                 self.stats["spoken"] += 1
             except Exception as e:
                 self.stats["errors"] += 1
@@ -1074,8 +1119,10 @@ class Engine:
     # --- прерывистый режим: оригинал, потом тот же отрывок с переводом (повторы и паузы настраиваются)
     def fragment(self, start, end, say, tts, mute_others):
         media = self.app.media
+        self.guard(3.0)
         media.seek(start)
         media.wait_near(start)
+        self.guard(1.5)
         if mute_others and CFG["mute_original"]:
             self.app.muter.mute()
         if say:
@@ -1083,17 +1130,19 @@ class Engine:
                 tts.say_now(say[0], CFG["target"], int(CFG["speed"]), say[1])
             except Exception as e:
                 log("озвучка отрывка: %s" % e)
+        self.guard(1.5)
         media.play()
         t0 = time.time()
         limit = (end - start) / 1000.0 + 4
-        while not self.stop_evt.is_set() and time.time() - t0 < limit:
+        while not self.halt.is_set() and time.time() - t0 < limit:
             pos = media.position_ms()
             if pos is not None and pos >= end:
                 break
             time.sleep(0.03)
+        self.guard(2.0)
         media.pause()
         if say:
-            tts.wait_done(self.stop_evt, 40)
+            tts.wait_done(self.halt, 40)
         if mute_others:
             self.app.muter.restore()
 
@@ -1103,6 +1152,7 @@ class Engine:
         self.gate = True
         mp3 = None
         try:
+            self.guard(3.0)
             media.pause()
             res = self.understand(ph.audio)
             if not res:
@@ -1120,7 +1170,7 @@ class Engine:
                 except Exception as e:
                     log("Edge: %s" % e)
             for i in range(n):
-                if self.stop_evt.is_set():
+                if self.halt.is_set():
                     break
                 if seek_ok and i > 0:                            # оригинал ещё раз
                     self.app.ui(self.app.subs.show_sub, sub, "orig")
@@ -1132,16 +1182,19 @@ class Engine:
                 else:                                            # перематывать нельзя: говорим на паузе
                     if CFG["mute_original"]:
                         self.app.muter.mute()
-                    tts.speak(speak, target, self.stop_evt)
+                    tts.speak(speak, target, self.halt)
                     self.app.muter.restore()
                 self.stats["spoken"] += 1
                 self.wait(gap)
             self.app.ui(self.app.subs.hide)
-            if seek_ok:
+            if seek_ok and not self.hold.is_set():
+                self.guard(3.0)
                 media.seek(ph.end)
         finally:
             self.app.muter.restore()
-            media.play()
+            if not self.hold.is_set():                           # на паузе пользователя видео не трогаем
+                self.guard(2.0)
+                media.play()
             if mp3:
                 try:
                     os.remove(mp3)
@@ -1198,6 +1251,8 @@ class Engine:
         w = {"playing": None, "pos": None, "t": None, "lost": None}
 
         def watch():
+            if self.hold.is_set():
+                return "пауза"
             st = media.info()
             now = time.time()
             if st is None:
@@ -1256,8 +1311,13 @@ class Engine:
                     self.gate = False
                     self.phase = 0
                     app.ui(app.subs.hide)
-                    app.ui(app.banner_idle)
-                    self.wait(0.3)
+                    if str(r) == "пауза":                            # ждём, пока пользователь сам включит видео
+                        while not self.stop_evt.is_set() and CFG["mode"] == "continuous" and self.hold.is_set():
+                            time.sleep(0.15)
+                        self.wait(0.3)
+                    else:
+                        app.ui(app.banner_idle)
+                        self.wait(0.3)
         finally:
             app.master.set(False)
             app.muter.restore()
@@ -1297,9 +1357,10 @@ class Engine:
         self.silent_prep = not first
         self.phase = 1
         muted = False if first else app.master.set(True)
-        if first:
+        if first and self.autoplay:
+            self.autoplay = False
             self.guard(2.0)
-            media.play()                                           # видео запускается само
+            media.play()                                           # при включении перевода видео запускается само
         t_play, last, unmuted = 0.0, time.time(), False
         while alive():
             now = time.time()
@@ -1314,7 +1375,7 @@ class Engine:
             if pos >= p0 + block or t_play > block / 1000.0 * 2 + 30:
                 break
             pct = max(0, min(100, int((pos - p0) * 100 / block)))
-            app.ui(app.banner.show, "Непрерывный перевод: подгрузка %d %% %s" % (
+            app.ui(app.banner.status, "Непрерывный перевод: подгрузка %d %% %s" % (
                 pct, "(оригинал слышно один раз)" if first else "(без звука, перевод — в субтитрах)"))
             if muted and not unmuted and pos - p0 > 6000 and self.loud_prep == 0:
                 app.master.set(False)                              # без звука запись ничего не слышит — включаем
@@ -1329,7 +1390,7 @@ class Engine:
                 left = self.pending
             if left <= 0:
                 break
-            app.ui(app.banner.show, "Непрерывный перевод: перевожу первые фразы…")
+            app.ui(app.banner.status, "Непрерывный перевод: перевожу первые фразы…")
             time.sleep(0.2)
         app.master.set(False)
         self.phase = 2
@@ -1371,7 +1432,7 @@ class Engine:
                 shown = None
             time.sleep(0.03)
         self.stats["spoken"] += len(self.spoken)
-        tts.wait_done(self.stop_evt, 15)                           # договорить последнюю фразу, пока видео идёт дальше
+        tts.wait_done(self.halt, 15)                               # договорить последнюю фразу, пока видео идёт дальше
         app.ui(app.subs.hide)
         app.muter.restore()
         for it in self.items:
@@ -1499,12 +1560,14 @@ def exstyle(win, clickthrough):
 HINT = "Перевод видео и аудио включён F10. Меню F10. Выключить — Esc или дважды F10"
 
 class Banner:
-    """Подсказка самого вверху экрана; мышь проходит сквозь неё."""
+    """Подсказка самого вверху экрана (всё время, пока идёт перевод) и под ней строка состояния."""
     def __init__(self, root):
         self.root = root
         self.win = None
-        self.lbl = None
-        self.job = None
+        self.hint = None
+        self.stat = None
+        self.active = False
+        self.stat_text = None
 
     def _ensure(self):
         if self.win is not None:
@@ -1514,33 +1577,45 @@ class Banner:
         w.attributes("-topmost", True)
         w.attributes("-alpha", 0.97)
         w.configure(bg="black")
-        self.lbl = tk.Label(w, text="", fg="white", bg="black", font=("Segoe UI", 14, "bold"), padx=18, pady=8)
-        self.lbl.pack()
+        self.hint = tk.Label(w, text="", fg="white", bg="black", font=("Segoe UI", 14, "bold"), padx=18, pady=6)
+        self.hint.pack()
+        self.stat = tk.Label(w, text="", fg="#ffd400", bg="black", font=("Segoe UI", 12, "bold"), padx=18, pady=2)
         w.withdraw()
         w.update_idletasks()
         exstyle(w, True)
         self.win = w
 
-    def show(self, text, ms=None):
-        self._ensure()
-        if self.job:
-            self.root.after_cancel(self.job)
-            self.job = None
-        self.lbl.config(text=text)
+    def _place(self):
         self.win.update_idletasks()
         w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
         sw = self.win.winfo_screenwidth()
         self.win.geometry("%dx%d+%d+%d" % (w, h, max(0, (sw - w) // 2), 4))
         self.win.deiconify()
         self.win.lift()
-        if ms:
-            self.job = self.root.after(ms, self.hide)
+
+    def on(self, text):
+        """Включить подсказку: она видна, пока идёт перевод."""
+        self._ensure()
+        self.active = True
+        self.hint.config(text=text)
+        self.status(self.stat_text)
+
+    def status(self, text):
+        self.stat_text = text
+        if not self.active or self.win is None:
+            return
+        if text:
+            self.stat.config(text=text)
+            self.stat.pack()
+        else:
+            self.stat.pack_forget()
+        self._place()
 
     def hide(self):
-        if self.job:
-            self.root.after_cancel(self.job)
-            self.job = None
+        self.active = False
+        self.stat_text = None
         if self.win is not None:
+            self.stat.pack_forget()
             self.win.withdraw()
 
 class Subtitles:
@@ -1870,10 +1945,7 @@ class App:
             self.stop()
 
     def banner_idle(self):
-        if self.engine is not None and CFG.get("banner_always"):
-            self.banner.show(HINT)
-        else:
-            self.banner.hide()
+        self.banner.status(None)                                  # подсказка остаётся, строка состояния очищается
 
     def on_f10(self):
         now = time.time()
@@ -1909,7 +1981,7 @@ class App:
         self.engine = Engine(self)
         self.engine.start()
         self.set_status("Перевод включён. F10 — меню, F10 два раза подряд — выключить.")
-        self.banner.show(HINT, None if CFG.get("banner_always") else 9000)
+        self.banner.on(HINT)                                      # видна всё время, пока идёт перевод
         if CFG.get("esc_stops"):
             self.esc_hotkey(True)
         self.on_mode_changed()
@@ -2051,16 +2123,12 @@ class App:
         # те же настройки, что в коротком меню: режимы, субтитры, паузы, повторы, громкость
         self.refresh_controls = add_controls(inner, False, self)
         self.v_esc = tk.BooleanVar(value=bool(CFG.get("esc_stops", True)))
-        self.v_ban = tk.BooleanVar(value=bool(CFG.get("banner_always", False)))
 
         def chg2():
             CFG["esc_stops"] = bool(self.v_esc.get())
-            CFG["banner_always"] = bool(self.v_ban.get())
             save_settings()
         ttk.Checkbutton(inner, text="Esc выключает перевод (пока перевод включён, Esc не работает в других программах)",
                         variable=self.v_esc, command=chg2).pack(anchor="w", padx=12, pady=(8, 0))
-        ttk.Checkbutton(inner, text="Держать подсказку «F10 / Esc» вверху экрана всё время (иначе она видна 9 секунд)",
-                        variable=self.v_ban, command=chg2).pack(anchor="w", padx=12)
 
         # потоки распознавания — только здесь
         lab = ttk.Label(inner, text="")
