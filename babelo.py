@@ -4,7 +4,7 @@ Babelo для Windows — живой перевод любого звука, к�
 F10: первое нажатие — перевод включён; ещё раз — выезжает меню; два раза подряд — перевод выключен.
 Распознавание (Whisper) -> перевод (NLLB) -> озвучка (голос Windows или Edge), оригинал заглушается, субтитры белым по чёрному.
 """
-import os, sys, json, time, threading, queue, ctypes, traceback, re, tempfile, math, gc, subprocess, asyncio, datetime
+import os, sys, json, time, threading, queue, ctypes, traceback, re, tempfile, math, gc, subprocess, asyncio, datetime, bisect
 
 # программа без консоли: у неё нет stdout/stderr, а библиотеки в них пишут
 if sys.stdout is None:
@@ -19,7 +19,7 @@ if os.name != "nt":
 
 import numpy as np
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog, simpledialog
 
 APP = "Babelo"
 APP_BUILD = 0                      # номер сборки: при сборке на GitHub подставляется автоматически
@@ -59,7 +59,7 @@ TEST_PHRASE = {"ru": "Привет! Это проверка голоса Babelo.
 DEFAULTS = {"target": "ru", "source": "auto", "whisper": "small", "phrase_sec": 5, "pause_ms": 400,
             "speed": 100, "volume": 100, "mute_original": True, "engine": "sapi", "voice": "", "threads": 4, "github_token": "",
             "mode": "live", "pause_s": 2, "repeats": 1, "block_sec": 60, "subs": "translated",
-            "esc_stops": True}
+            "esc_stops": True, "orig_vol": 15}
 
 # ---------------------------------------------------------------- журнал и настройки
 LOG_LINES = []
@@ -311,6 +311,17 @@ class ModelHub:
                 self.whisper = WhisperModel(self.whisper_dir(size), device="cpu", compute_type="int8",
                                             cpu_threads=threads, num_workers=1)
                 self.wkey = key
+            if self.nllb is None:
+                import ctranslate2
+                import sentencepiece as spm
+                self.nllb = ctranslate2.Translator(NLLB_DIR, device="cpu", compute_type="int8",
+                                                   intra_threads=threads, inter_threads=1)
+                self.sp = spm.SentencePieceProcessor()
+                self.sp.load(os.path.join(NLLB_DIR, "sentencepiece.bpe.model"))
+
+    def load_nllb(self, threads):
+        """Только переводчик (для расширения браузера): без модели распознавания."""
+        with self.lock:
             if self.nllb is None:
                 import ctranslate2
                 import sentencepiece as spm
@@ -1540,6 +1551,7 @@ def add_controls(parent, dark, app):
     refresh.append(add_slider(parent, dark, "Непрерывный: длина отрезка подгрузки вперёд, с (1–180)", 1, 180, "block_sec"))
     refresh.append(add_slider(parent, dark, "Слушать фразу не дольше, с", 2, 15, "phrase_sec"))
     refresh.append(add_slider(parent, dark, "Пауза конца фразы, мс", 200, 1000, "pause_ms"))
+    refresh.append(add_slider(parent, dark, "Громкость оригинала в обычном режиме (проигрыватель), %", 0, 100, "orig_vol"))
     refresh.append(add_slider(parent, dark, "Скорость озвучки, %", 70, 150, "speed"))
     refresh.append(add_slider(parent, dark, "Громкость перевода, %", 10, 100, "volume"))
     for r in refresh:
@@ -1855,6 +1867,506 @@ class Menu:
             except Exception:
                 pass
 
+# ---------------------------------------------------------------- сервер для расширения браузера
+class LocalServer:
+    """Расширение Chrome/Edge просит у Babelo перевод (NLLB) с выравниванием слов. Только 127.0.0.1."""
+    PORT = 47831
+
+    def __init__(self):
+        self.httpd = None
+
+    def translate(self, body):
+        src, tgt = body.get("src"), body.get("tgt")
+        if src not in LANGS or tgt not in LANGS:
+            raise ValueError("язык не поддерживается")
+        if not os.path.exists(os.path.join(NLLB_DIR, "model.bin")):
+            raise RuntimeError("модель перевода ещё не скачана — нажмите «Скачать модели» в Babelo")
+        HUB.load_nllb(int(CFG["threads"]))
+        out = []
+        for t in body.get("texts", []):
+            tr, pairs = HUB.translate_aligned(str(t)[:1500], src, tgt)
+            out.append({"tr": tr, "pairs": pairs})
+        return {"results": out}
+
+    def start(self):
+        import http.server
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, obj):
+                data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                if self.path == "/ping":
+                    self._send(200, {"ok": True, "build": APP_BUILD,
+                                     "models": os.path.exists(os.path.join(NLLB_DIR, "model.bin"))})
+                else:
+                    self._send(404, {})
+
+            def do_POST(self):
+                try:
+                    n = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(n) or b"{}")
+                    if self.path == "/translate":
+                        self._send(200, outer.translate(body))
+                    elif self.path == "/reverse":
+                        HUB.load_nllb(int(CFG["threads"]))
+                        self._send(200, {"word": HUB.reverse_word(str(body.get("word", ""))[:80], body["src"], body["tgt"])})
+                    else:
+                        self._send(404, {})
+                except Exception as e:
+                    log("сервер расширения: %s" % e)
+                    self._send(500, {"error": str(e)})
+        try:
+            self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", self.PORT), Handler)
+            threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+            log("сервер для расширения браузера: http://127.0.0.1:%d" % self.PORT)
+        except Exception as e:
+            log("сервер для расширения не запущен: %s" % e)
+
+# ---------------------------------------------------------------- проигрыватель файлов (libmpv)
+class Mpv:
+    """Минимальная обёртка над libmpv-2.dll через ctypes (без python-mpv)."""
+    def __init__(self, wid):
+        dll = None
+        dirs = [os.path.dirname(os.path.abspath(sys.executable)), getattr(sys, "_MEIPASS", ""),
+                os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "_internal"),
+                os.path.dirname(os.path.abspath(__file__)), os.getcwd()]
+        for d in dirs:
+            if d and os.path.exists(os.path.join(d, "libmpv-2.dll")):
+                dll = os.path.join(d, "libmpv-2.dll")
+                try:
+                    os.add_dll_directory(d)
+                except Exception:
+                    pass
+                os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+                break
+        if dll is None:
+            raise RuntimeError("не найден libmpv-2.dll: проигрыватель недоступен в этой сборке")
+        L = ctypes.CDLL(dll)
+        c_void_p, c_char_p = ctypes.c_void_p, ctypes.c_char_p
+        L.mpv_create.restype = c_void_p
+        L.mpv_initialize.argtypes = [c_void_p]
+        L.mpv_set_option_string.argtypes = [c_void_p, c_char_p, c_char_p]
+        L.mpv_set_property_string.argtypes = [c_void_p, c_char_p, c_char_p]
+        L.mpv_get_property_string.argtypes = [c_void_p, c_char_p]
+        L.mpv_get_property_string.restype = c_void_p
+        L.mpv_free.argtypes = [c_void_p]
+        L.mpv_command.argtypes = [c_void_p, ctypes.POINTER(c_char_p)]
+        L.mpv_terminate_destroy.argtypes = [c_void_p]
+        self.L = L
+        self.h = L.mpv_create()
+        if not self.h:
+            raise RuntimeError("libmpv не создан")
+        for k, v in (("wid", str(int(wid))), ("keep-open", "yes"), ("osc", "no"), ("input-default-bindings", "no"),
+                     ("input-vo-keyboard", "no"), ("sub-auto", "no"), ("hwdec", "auto-safe"), ("idle", "yes")):
+            L.mpv_set_option_string(self.h, k.encode(), v.encode())
+        if L.mpv_initialize(self.h) < 0:
+            raise RuntimeError("libmpv не запустился")
+
+    def get(self, name):
+        p = self.L.mpv_get_property_string(self.h, name.encode())
+        if not p:
+            return None
+        s = ctypes.cast(p, ctypes.c_char_p).value.decode("utf-8", "ignore")
+        self.L.mpv_free(p)
+        return s
+
+    def getf(self, name):
+        try:
+            return float(self.get(name))
+        except (TypeError, ValueError):
+            return None
+
+    def set(self, name, value):
+        self.L.mpv_set_property_string(self.h, name.encode(), str(value).encode("utf-8"))
+
+    def command(self, *args):
+        arr = (ctypes.c_char_p * (len(args) + 1))(*[str(a).encode("utf-8") for a in args], None)
+        return self.L.mpv_command(self.h, arr)
+
+    def destroy(self):
+        try:
+            if self.h:
+                self.L.mpv_terminate_destroy(self.h)
+        finally:
+            self.h = None
+
+class FileSession:
+    """Проигрыватель файла с непрерывным переводом: звук читается вперёд быстрее реального времени,
+    перевод готов заранее, видео идёт без повторов. Режимы: обычный, непрерывный, прерывистый."""
+    def __init__(self, app, source):
+        self.app = app
+        self.source = source
+        self.stop_evt = threading.Event()
+        self.lock = threading.Lock()
+        self.items = {}
+        self.ver = 0
+        self.cov = []
+        self.done = False
+        self.duration = 0.0
+        self.audio = None
+        self.pipe_id = 0
+        self.last_restart = 0.0
+        self.buffering = True
+        self.guard_until = 0.0
+        self.closed = False
+        self.error = None
+        self.status = "Подготовка перевода…"
+        self.src_lang = "…"
+        self.dragging = False
+        self._build_window()
+        self.mpv = Mpv(self.vid.winfo_id())
+        self.mpv.command("loadfile", source)
+        self.mpv.set("pause", "yes")
+        self.mpv.set("volume", 0)
+        threading.Thread(target=self.pipeline, args=(0.0, self.pipe_id), daemon=True).start()
+        threading.Thread(target=self.play_loop, daemon=True).start()
+        self.app.root.after(300, self._tick_ui)
+
+    # --- окно
+    def _build_window(self):
+        root = self.app.root
+        w = tk.Toplevel(root)
+        w.title("Babelo — проигрыватель")
+        w.geometry("1000x640")
+        w.configure(bg="black")
+        self.win = w
+        self.vid = tk.Frame(w, bg="black")
+        self.vid.pack(fill="both", expand=True)
+        bar = tk.Frame(w, bg="#222")
+        bar.pack(fill="x")
+        tk.Button(bar, text="⏯", width=4, command=self.toggle_pause).pack(side="left", padx=4, pady=4)
+        self.scale = ttk.Scale(bar, from_=0, to=1000, orient="horizontal")
+        self.scale.pack(side="left", fill="x", expand=True, padx=6)
+        self.scale.bind("<ButtonPress-1>", lambda e: setattr(self, "dragging", True))
+        self.scale.bind("<ButtonRelease-1>", self._seek_release)
+        self.lbl = tk.Label(bar, text="0:00 / 0:00", fg="white", bg="#222", width=14)
+        self.lbl.pack(side="left")
+        tk.Button(bar, text="Меню F10", command=self.app.menu.toggle).pack(side="left", padx=4)
+        tk.Button(bar, text="⛶", width=3, command=self.fullscreen).pack(side="left", padx=4)
+        w.protocol("WM_DELETE_WINDOW", self.app.stop)
+        w.update_idletasks()
+
+    def fullscreen(self):
+        self.win.attributes("-fullscreen", not bool(self.win.attributes("-fullscreen")))
+
+    def toggle_pause(self):
+        if self.buffering:
+            return
+        self.mpv.set("pause", "no" if self.mpv.get("pause") == "yes" else "yes")
+
+    def _seek_release(self, _e):
+        self.dragging = False
+        if self.duration > 0:
+            self.guard()
+            self.mpv.command("seek", self.scale.get() / 1000.0 * self.duration, "absolute+exact")
+
+    def _tick_ui(self):
+        if self.closed:
+            return
+        try:
+            pos = self.mpv.getf("time-pos") or 0.0
+            dur = self.duration or (self.mpv.getf("duration") or 0.0)
+            if not self.dragging and dur > 0:
+                self.scale.set(pos / dur * 1000)
+            fmt = lambda s: "%d:%02d" % (int(s) // 60, int(s) % 60)
+            self.lbl.config(text="%s / %s" % (fmt(pos), fmt(dur)))
+            self.win.after(300, self._tick_ui)
+        except Exception:
+            pass
+
+    def guard(self, sec=1.5):
+        self.guard_until = time.time() + sec
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.stop_evt.set()
+        try:
+            self.mpv.destroy()
+        except Exception:
+            pass
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+    # --- покрытие: какие участки файла уже переведены
+    def extend_cov(self, a, b):
+        with self.lock:
+            for iv in self.cov:
+                if iv[0] - 0.5 <= a <= iv[1] + 0.5:
+                    iv[0] = min(iv[0], a)
+                    iv[1] = max(iv[1], b)
+                    return
+            self.cov.append([a, b])
+
+    def in_cov(self, pos):
+        with self.lock:
+            return any(iv[0] - 0.6 <= pos <= iv[1] for iv in self.cov)
+
+    def covered(self, pos, lead):
+        with self.lock:
+            return any(iv[0] - 0.6 <= pos and (iv[1] >= pos + lead or (self.duration and iv[1] >= self.duration - 0.5))
+                       for iv in self.cov)
+
+    def restart_pipeline(self, from_s):
+        self.pipe_id += 1
+        self.last_restart = time.time()
+        threading.Thread(target=self.pipeline, args=(max(0.0, from_s - 1.0), self.pipe_id), daemon=True).start()
+
+    # --- чтение вперёд: распознать -> перевести -> (озвучить заранее для Edge)
+    def add_segment(self, s0, s1, text, frm, tts):
+        target = CFG["target"]
+        sents = HUB._sentences(text) or [text]
+        lens = [max(1, len(s)) for s in sents]
+        total = float(sum(lens))
+        t = s0
+        for s, ln in zip(sents, lens):
+            a, b = t, t + (s1 - s0) * ln / total
+            t = b
+            try:
+                tr, pairs = HUB.translate_aligned(s, frm, target)
+            except Exception as e:
+                log("перевод фразы: %s" % e)
+                continue
+            speak = clean_text(tr)[:500]
+            if not any(c.isalpha() for c in speak):
+                continue
+            win = max(1.0, b - a + 0.8)
+            pct = int(min(220, max(int(CFG["speed"]), len(speak) / (13.0 * win) * 100)))
+            mp3 = None
+            if CFG["engine"] == "edge":
+                try:
+                    mp3 = tts.edge_file(speak, target, pct)
+                except Exception as e:
+                    log("Edge: %s" % e)
+            sub = {"orig": s, "tr": tr, "pairs": pairs, "frm": frm, "to": target}
+            it = Item(int(a * 1000), int(b * 1000), sub, speak, mp3, pct)
+            with self.lock:
+                self.items[it.start] = it
+                self.ver += 1
+
+    def pipeline(self, from_s, pid):
+        try:
+            self.status = "Загружаю модели…"
+            HUB.load(CFG["whisper"], int(CFG["threads"]))
+            if self.audio is None:
+                self.status = "Читаю звук файла…"
+                from faster_whisper.audio import decode_audio
+                self.audio = decode_audio(self.source, sampling_rate=16000)
+                self.duration = len(self.audio) / 16000.0
+            forced = None if CFG["source"] == "auto" else CFG["source"]
+            audio = self.audio[int(from_s * 16000):]
+            kw = dict(language=forced, beam_size=1, best_of=1, temperature=0.0, condition_on_previous_text=False)
+            try:
+                segs, info = HUB.whisper.transcribe(audio, vad_filter=True,
+                                                    vad_parameters={"min_silence_duration_ms": 350}, **kw)
+            except Exception as e:
+                log("без VAD: %s" % e)
+                segs, info = HUB.whisper.transcribe(audio, **kw)
+            frm = forced or info.language
+            self.src_lang = frm
+            if frm not in LANGS:
+                raise RuntimeError("язык файла «%s» не поддерживается" % frm)
+            if frm == CFG["target"]:
+                raise RuntimeError("язык файла уже совпадает с языком перевода")
+            com_init()
+            tts = Tts()
+            cov_a = from_s
+            for seg in segs:
+                if self.stop_evt.is_set() or pid != self.pipe_id:
+                    return
+                s0, s1 = from_s + seg.start, from_s + seg.end
+                text = seg.text.strip()
+                if text and len(text) <= (s1 - s0) * 25 + 40:
+                    self.add_segment(s0, s1, text, frm, tts)
+                self.extend_cov(cov_a, s1)
+            self.extend_cov(cov_a, self.duration)
+            if from_s <= 1.0:
+                self.done = True
+            self.status = "Перевод файла готов"
+        except Exception as e:
+            self.error = str(e)
+            log("файл: %s" % e)
+            log(traceback.format_exc())
+            self.app.ui(self.app.subs.flash, "Файл: %s" % str(e)[:100], 6000)
+
+    # --- воспроизведение
+    def wait(self, sec):
+        t0 = time.time()
+        while time.time() - t0 < sec and not self.stop_evt.is_set():
+            time.sleep(0.05)
+
+    def play_until(self, end_s, timeout):
+        t0 = time.time()
+        while not self.stop_evt.is_set() and time.time() - t0 < timeout:
+            p = self.mpv.getf("time-pos")
+            if p is not None and p >= end_s:
+                break
+            time.sleep(0.03)
+
+    def run_interrupted(self, it, tts):
+        mpv, app = self.mpv, self.app
+        target = CFG["target"]
+        n = max(1, int(CFG["repeats"]))
+        gap = float(CFG["pause_s"])
+        st, en = it.start / 1000.0, it.end / 1000.0
+        self.guard(6)
+        mpv.set("pause", "yes")
+        for r in range(n):
+            if self.stop_evt.is_set():
+                break
+            if r > 0:                                                   # оригинал ещё раз
+                app.ui(app.subs.show_sub, it.sub, "orig")
+                self.guard(4)
+                mpv.set("volume", 100)
+                mpv.command("seek", st, "absolute+exact")
+                time.sleep(0.15)
+                mpv.set("pause", "no")
+                self.play_until(en, en - st + 4)
+                mpv.set("pause", "yes")
+            self.wait(gap)                                              # пауза между фразой и переводом
+            app.ui(app.subs.show_sub, it.sub, "tr")
+            self.guard(4)
+            mpv.set("volume", 0 if CFG["mute_original"] else 100)
+            mpv.command("seek", st, "absolute+exact")
+            time.sleep(0.15)
+            try:
+                tts.say_now(it.speak, target, it.pct, it.mp3)
+            except Exception as e:
+                log("озвучка: %s" % e)
+            mpv.set("pause", "no")
+            self.play_until(en, en - st + 4)
+            mpv.set("pause", "yes")
+            tts.wait_done(self.stop_evt, 40)
+            mpv.set("volume", 100)
+            self.wait(gap)
+        app.ui(app.subs.hide)
+        self.guard(4)
+        mpv.command("seek", en, "absolute+exact")
+        mpv.set("pause", "no")
+
+    def play_loop(self):
+        com_init()
+        tts = Tts()
+        mpv, app = self.mpv, self.app
+        items, starts, ptr, last_ver = [], [], 0, -1
+        last_pos, last_t, shown = None, time.time(), None
+        elastic, elastic_t, last_status, vol_set = False, 0.0, None, None
+        while not self.stop_evt.is_set():
+            time.sleep(0.04)
+            try:
+                pos = mpv.getf("time-pos")
+                if pos is None:
+                    if self.error:
+                        app.ui(app.banner.status, "Ошибка: %s" % self.error)
+                        time.sleep(0.5)
+                    continue
+                now = time.time()
+                paused = mpv.get("pause") == "yes"
+                mode = CFG["mode"]
+                if last_ver != self.ver:
+                    with self.lock:
+                        items = sorted(self.items.values(), key=lambda x: x.start)
+                    starts = [i.start for i in items]
+                    last_ver = self.ver
+                    ptr = bisect.bisect_left(starts, int(pos * 1000) - 250)
+                if last_pos is not None and now > self.guard_until:       # перемотка пользователя
+                    expected = last_pos if (paused or self.buffering) else last_pos + (now - last_t)
+                    if abs(pos - expected) > 1.5:
+                        tts.stop_now()
+                        app.ui(app.subs.hide)
+                        shown = None
+                        ptr = bisect.bisect_left(starts, int(pos * 1000) - 250)
+                        if not self.in_cov(pos) and now - self.last_restart > 2:
+                            self.restart_pipeline(pos)
+                last_pos, last_t = pos, now
+                # --- запас вперёд: без готового перевода видео ждёт
+                lead = max(3, min(int(CFG["block_sec"]), 60))
+                if not self.done and not self.error:
+                    if not self.covered(pos, 1.0):
+                        if not self.buffering:
+                            self.buffering = True
+                            mpv.set("pause", "yes")
+                            tts.stop_now()
+                        if not self.in_cov(pos) and now - self.last_restart > 3 and self.audio is not None:
+                            self.restart_pipeline(pos)
+                    elif self.buffering and self.covered(pos, lead):
+                        self.buffering = False
+                        mpv.set("pause", "no")
+                elif self.buffering and (self.done or self.error):
+                    self.buffering = False
+                    mpv.set("pause", "no")
+                if self.buffering:
+                    with self.lock:
+                        top = max([iv[1] for iv in self.cov] or [0.0])
+                    pct = int(top * 100 / self.duration) if self.duration else 0
+                    text = "%s %d %%" % (self.status if not self.cov else "Подготовка перевода", pct)
+                else:
+                    text = None
+                if text != last_status:
+                    last_status = text
+                    app.ui(app.banner.status, text)
+                if self.buffering:
+                    continue
+                if paused and not elastic:                                   # пользователь на паузе: перевод ждёт
+                    tts.stop_now()
+                    continue
+                target = CFG["target"]
+                if mode == "interrupted":
+                    if vol_set != 100:
+                        mpv.set("volume", 100)
+                        vol_set = 100
+                    if ptr < len(items) and pos * 1000 >= items[ptr].end:
+                        it = items[ptr]
+                        ptr += 1
+                        if pos * 1000 - it.end < 800:
+                            self.run_interrupted(it, tts)
+                            last_pos = None
+                    continue
+                v = int(CFG["orig_vol"]) if (mode == "live" and CFG["mute_original"]) else (0 if mode == "continuous" or CFG["mute_original"] else 100)
+                if vol_set != v:
+                    mpv.set("volume", v)
+                    vol_set = v
+                while ptr < len(items) and pos * 1000 >= items[ptr].start - 250:
+                    it = items[ptr]
+                    ptr += 1
+                    if pos * 1000 <= it.end + 1500:
+                        shown = it
+                        app.ui(app.subs.show_sub, it.sub, "tr")
+                        try:
+                            tts.say_now(it.speak, target, it.pct, it.mp3)
+                        except Exception as e:
+                            log("озвучка: %s" % e)
+                if shown is not None and pos * 1000 > shown.end + 200:
+                    if tts.busy():                                          # речь длиннее фразы: видео чуть ждёт
+                        if not elastic:
+                            elastic, elastic_t = True, now
+                            mpv.set("pause", "yes")
+                        elif now - elastic_t > 6:
+                            tts.stop_now()
+                    else:
+                        if elastic:
+                            elastic = False
+                            mpv.set("pause", "no")
+                        app.ui(app.subs.hide)
+                        shown = None
+            except Exception as e:
+                log("проигрыватель: %s" % e)
+                time.sleep(0.3)
+        tts.stop_now()
+
 # ---------------------------------------------------------------- программа
 class App:
     def __init__(self):
@@ -1879,6 +2391,9 @@ class App:
         self.banner = Banner(self.root)
         self.menu = Menu(self)
         self.hk_tid = None
+        self.filesess = None
+        self.server = LocalServer()
+        self.server.start()
         self.hidden_note = False
         self.log_shown = 0
         self.dl_cancel = threading.Event()
@@ -1941,7 +2456,7 @@ class App:
             ctypes.windll.user32.PostThreadMessageW(self.hk_tid, 0x8001 if on else 0x8002, 0, 0)
 
     def on_esc(self):
-        if self.engine is not None:
+        if self.engine is not None or self.filesess is not None:
             self.stop()
 
     def banner_idle(self):
@@ -1951,7 +2466,7 @@ class App:
         now = time.time()
         quick = now - self.last_f10 < 0.45
         self.last_f10 = now
-        if self.engine is None:
+        if self.engine is None and self.filesess is None:
             self.start()
         elif quick:
             self.menu.hide()
@@ -1987,9 +2502,13 @@ class App:
         self.on_mode_changed()
 
     def stop(self):
+        had_engine = self.engine is not None
         if self.engine is not None:
             self.engine.stop()
             self.engine = None
+        fs, self.filesess = self.filesess, None
+        if fs is not None:
+            fs.close()
         self.muter.restore()
         self.master.set(False)
         self.esc_hotkey(False)
@@ -1997,7 +2516,8 @@ class App:
         self.subs.hide()
         self.banner.hide()
         try:
-            self.media.play()                                     # не оставляем видео на паузе
+            if had_engine:
+                self.media.play()                                 # не оставляем видео на паузе
         except Exception:
             pass
         self.set_status("Перевод выключен. F10 — включить.")
@@ -2054,6 +2574,10 @@ class App:
         outer, inner, canvas = make_scroll(r)
         outer.pack(side="top", fill="both", expand=True)
 
+        fb = ttk.Frame(inner)
+        fb.pack(fill="x", padx=10, pady=(8, 2))
+        ttk.Button(fb, text="Открыть видео/аудио файл (проигрыватель с непрерывным переводом)", command=self.pick_file).pack(side="left", padx=2)
+        ttk.Button(fb, text="Открыть ссылку…", command=self.pick_url).pack(side="left", padx=2)
         f = ttk.Frame(inner)
         f.pack(fill="x", padx=10, pady=4)
         names = [LANGS[c][0] for c in LANGS]
@@ -2170,6 +2694,35 @@ class App:
         self.btn_update.pack(side="left", padx=4)
         ttk.Button(bar, text="Проверить голос", command=self.test_voice).pack(side="left", padx=4)
 
+    def pick_file(self):
+        p = filedialog.askopenfilename(title="Видео или аудио", filetypes=[
+            ("Видео и аудио", "*.mp4 *.mkv *.avi *.mov *.webm *.m4v *.ts *.mp3 *.m4a *.wav *.flac *.ogg"), ("Все файлы", "*.*")])
+        if p:
+            self.open_file(p)
+
+    def pick_url(self):
+        u = simpledialog.askstring("Ссылка", "Прямая ссылка на видео или аудио (mp4, m3u8, mp3…):", parent=self.root)
+        if u:
+            self.open_file(u.strip())
+
+    def open_file(self, path):
+        if not HUB.ready(CFG["whisper"]):
+            self.set_status("Сначала скачайте модели (кнопка «Скачать модели»).")
+            return
+        if self.engine is not None or self.filesess is not None:
+            self.stop()
+        try:
+            self.filesess = FileSession(self, path)
+        except Exception as e:
+            self.filesess = None
+            self.set_status("Не удалось открыть проигрыватель: %s" % e)
+            log(traceback.format_exc())
+            return
+        self.banner.on(HINT)
+        if CFG.get("esc_stops"):
+            self.esc_hotkey(True)
+        self.set_status("Файл открыт: перевод готовится вперёд, потом видео пойдёт с переводом. F10 — меню.")
+
     def refresh_models_state(self):
         w = os.path.exists(os.path.join(HUB.whisper_dir(CFG["whisper"]), "model.bin"))
         n = os.path.exists(os.path.join(NLLB_DIR, "model.bin"))
@@ -2277,7 +2830,10 @@ class App:
 
     def _tick(self):
         e = self.engine
-        if e is None:
+        if self.filesess is not None:
+            fs = self.filesess
+            txt = "Проигрыватель: %s · фраз переведено: %d · язык файла: %s" % (fs.status, len(fs.items), fs.src_lang)
+        elif e is None:
             txt = "Перевод выключен. F10 — включить."
         else:
             if not e.listening:
