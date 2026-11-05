@@ -17,14 +17,26 @@ jobs:
       - name: Set build number
         run: |
           (Get-Content babelo.py -Raw -Encoding UTF8) -replace 'APP_BUILD = 0 ', 'APP_BUILD = ${{ github.run_number }} ' | Set-Content babelo.py -Encoding UTF8 -NoNewline
+      - name: Get libmpv for the video player
+        continue-on-error: true
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/SubtitleEdit/support-files/releases/download/libmpv-2026-08-14b/libmpv2-win64.zip" -OutFile libmpv.zip
+          Expand-Archive libmpv.zip -DestinationPath libmpv -Force
+          Get-ChildItem libmpv -Recurse | ForEach-Object { $_.FullName }
       - name: Build Babelo.exe
         run: |
-          pyinstaller --noconfirm --clean --onedir --windowed --name Babelo --collect-all faster_whisper --collect-all ctranslate2 --collect-all tokenizers --collect-all av --collect-all pyaudiowpatch --collect-all sentencepiece --collect-all edge_tts --collect-all pycaw --collect-all certifi --collect-all winsdk --hidden-import win32com.client --hidden-import pythoncom --hidden-import comtypes babelo.py
+          $extra = @()
+          $dll = Get-ChildItem libmpv -Recurse -Filter libmpv-2.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($dll) { $extra += "--add-binary"; $extra += ($dll.FullName + ";.") }
+          $vk = Get-ChildItem libmpv -Recurse -Filter vulkan-1.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($vk) { $extra += "--add-binary"; $extra += ($vk.FullName + ";.") }
+          pyinstaller --noconfirm --clean --onedir --windowed --name Babelo @extra --collect-all faster_whisper --collect-all ctranslate2 --collect-all tokenizers --collect-all av --collect-all onnxruntime --collect-all pyaudiowpatch --collect-all sentencepiece --collect-all edge_tts --collect-all pycaw --collect-all certifi --collect-all winsdk --hidden-import win32com.client --hidden-import pythoncom --hidden-import comtypes babelo.py
       - name: Zip
         run: |
           Compress-Archive -Path dist\Babelo -DestinationPath Babelo-windows.zip
+          Compress-Archive -Path extension\* -DestinationPath Babelo-extension.zip
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "win-${{ github.run_number }}" Babelo-windows.zip --title "Babelo for Windows ${{ github.run_number }}" --notes "Unzip, run Babelo.exe, download models, press F10. The program updates itself."
+          gh release create "win-${{ github.run_number }}" Babelo-windows.zip Babelo-extension.zip --title "Babelo for Windows ${{ github.run_number }}" --notes "Unzip, run Babelo.exe, download models, press F10. The browser extension is Babelo-extension.zip. The program updates itself."
