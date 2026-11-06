@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Babelo — перевод видео с озвучкой",
+  "version": "0.1.0",
+  "description": "Непрерывный перевод видео онлайн голосом и субтитрами. F10 — включить, меню, двойной F10 или Esc — выключить.",
+  "permissions": ["storage"],
+  "host_permissions": ["http://127.0.0.1:47831/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "Babelo", "default_popup": "popup.html" },
+  "content_scripts": [
+    { "matches": ["<all_urls>"], "js": ["core.js", "content.js"], "run_at": "document_idle", "all_frames": false },
+    { "matches": ["*://*.youtube.com/*"], "js": ["content_main.js"], "run_at": "document_start", "world": "MAIN" }
+  ]
+}
