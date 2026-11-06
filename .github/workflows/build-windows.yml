@@ -34,9 +34,11 @@ jobs:
       - name: Zip
         run: |
           Compress-Archive -Path dist\Babelo -DestinationPath Babelo-windows.zip
-          Compress-Archive -Path extension\* -DestinationPath Babelo-extension.zip
+          if (Test-Path extension) { Compress-Archive -Path extension\* -DestinationPath Babelo-extension.zip }
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "win-${{ github.run_number }}" Babelo-windows.zip Babelo-extension.zip --title "Babelo for Windows ${{ github.run_number }}" --notes "Unzip, run Babelo.exe, download models, press F10. The browser extension is Babelo-extension.zip. The program updates itself."
+          $files = @("Babelo-windows.zip")
+          if (Test-Path Babelo-extension.zip) { $files += "Babelo-extension.zip" }
+          gh release create "win-${{ github.run_number }}" @files --title "Babelo for Windows ${{ github.run_number }}" --notes "Unzip, run Babelo.exe, download models, press F10. The browser extension is Babelo-extension.zip. The program updates itself."
