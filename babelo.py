@@ -709,10 +709,57 @@ class MasterMute:
         if os.path.exists(MASTER_FILE):
             self.set(False)
 
+class Bridge:
+    """Состояние видео и команды (пауза, пуск, перемотка) через расширение Babelo в браузере.
+    Это точнее и надёжнее, чем плеер Windows: перемотка идёт изнутри самой страницы."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.state = None
+        self.t = 0.0
+        self.cmds = []
+        self.next_id = 1
+        self.acked = 0
+        self.session = int(time.time() * 1000) % 1000000007
+
+    def update(self, st):
+        with self.lock:
+            self.state = st
+            self.t = time.time()
+            self.acked = max(self.acked, int(st.get("ack") or 0))
+            self.cmds = [c for c in self.cmds if c["id"] > self.acked]
+            return self.cmds[0] if self.cmds else None
+
+    def fresh(self):
+        return self.state is not None and time.time() - self.t < 1.5
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.state or {}), self.t
+
+    def send(self, typ, t=None):
+        with self.lock:
+            cid = self.next_id
+            self.next_id += 1
+            self.cmds.append({"id": cid, "type": typ, "t": t})
+            return cid
+
+    def wait_ack(self, cid, timeout):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            with self.lock:
+                if self.acked >= cid:
+                    return True
+            time.sleep(0.03)
+        return False
+
+BRIDGE = Bridge()
+
 class MediaCtl:
     """Управление плеером Windows (YouTube в Chrome/Edge, Spotify и др.): позиция, пауза, перемотка."""
     def __init__(self):
         self.err = ""
+        self.src = "win"
+        self.seek_broken = False
         self.mgr = None
         self.state = None
         self.state_t = 0.0
@@ -748,6 +795,17 @@ class MediaCtl:
         return {"pos": int(pos * 1000), "playing": playing, "seek": seek, "rate": rate}
 
     def refresh(self):
+        if BRIDGE.fresh():                                   # расширение браузера: точная позиция и перемотка
+            snap, t = BRIDGE.snapshot()
+            self.state = {"pos": int(float(snap.get("pos", 0)) * 1000), "playing": bool(snap.get("playing")),
+                          "seek": bool(snap.get("seek")), "rate": float(snap.get("rate") or 1.0)}
+            self.state_t = t
+            if self.src != "ext":
+                self.src = "ext"
+                self.seek_broken = False
+            self.err = ""
+            return
+        self.src = "win"
         try:
             self.state = self._run(self._info())
             self.state_t = time.time()
@@ -780,6 +838,14 @@ class MediaCtl:
         return pos
 
     def _call(self, name, *args):
+        if self.src == "ext" and BRIDGE.fresh():
+            typ = {"try_play_async": "play", "try_pause_async": "pause",
+                   "try_change_playback_position_async": "seek"}[name]
+            cid = BRIDGE.send(typ, (args[0] / 1e7) if args else None)      # 100-нс тики -> секунды
+            ok = BRIDGE.wait_ack(cid, 1.2)
+            self.refresh()
+            return ok
+
         async def go():
             s = await self._session()
             if s is None:
@@ -802,12 +868,13 @@ class MediaCtl:
     def seek(self, ms):
         return self._call("try_change_playback_position_async", int(ms) * 10000)
 
-    def wait_near(self, ms, timeout=3.0):
-        """Ждёт, пока позиция плеера окажется рядом с ms (после перемотки)."""
+    def wait_near(self, ms, timeout=3.0, tol=None):
+        """Ждёт, пока позиция плеера окажется рядом с ms (после перемотки). False — перемотка не сработала."""
+        tol = tol if tol is not None else (700 if self.src == "ext" else 2500)
         t0 = time.time()
         while time.time() - t0 < timeout:
             p = self.position_ms()
-            if p is not None and abs(p - ms) < 2500:
+            if p is not None and abs(p - ms) < tol:
                 return True
             time.sleep(0.05)
             self.refresh()
@@ -1128,12 +1195,29 @@ class Engine:
         tts.stop_now()
 
     # --- прерывистый режим: оригинал, потом тот же отрывок с переводом (повторы и паузы настраиваются)
-    def fragment(self, start, end, say, tts, mute_others):
+    def notice(self, text, sec=9):
+        self.app.ui(self.app.banner.status, text)
+        t = threading.Timer(sec, lambda: self.app.ui(self.app.banner.status, None))
+        t.daemon = True
+        t.start()
+
+    def seek_to(self, ms, tol=None):
+        """Перемотка с проверкой: возвращает False, если плеер остался на прежнем месте."""
         media = self.app.media
         self.guard(3.0)
-        media.seek(start)
-        media.wait_near(start)
+        media.seek(ms)
+        ok = media.wait_near(ms, 3.0, tol)
         self.guard(1.5)
+        if not ok:
+            media.seek_broken = True
+            log("перемотка не сработала (источник: %s)" % media.src)
+            self.notice("Перемотка видео не сработала. Установите расширение Babelo в браузер или откройте видео в проигрывателе Babelo.")
+        return ok
+
+    def fragment(self, start, end, say, tts, mute_others):
+        media = self.app.media
+        if not self.seek_to(start, max(500, min(2500, int((end - start) * 0.45)))):
+            return False
         if mute_others and CFG["mute_original"]:
             self.app.muter.mute()
         if say:
@@ -1156,6 +1240,7 @@ class Engine:
             tts.wait_done(self.halt, 40)
         if mute_others:
             self.app.muter.restore()
+        return True
 
     def process_interrupted(self, ph, tts):
         media = self.app.media
@@ -1174,7 +1259,11 @@ class Engine:
             sub, speak = made
             n = max(1, int(CFG["repeats"]))
             gap = float(CFG["pause_s"])
-            seek_ok = media.can_seek() and ph.start is not None and ph.end is not None and ph.end > ph.start
+            seek_ok = (media.can_seek() and not media.seek_broken and ph.start is not None and ph.end is not None
+                       and ph.end > ph.start)
+            if not seek_ok:
+                self.notice("Нельзя перемотать видео назад (плеер: %s). Перевод звучит на паузе. Установите расширение Babelo "
+                            "в браузер или откройте файл в проигрывателе Babelo." % ("расширение" if media.src == "ext" else "Windows"))
             if CFG["engine"] == "edge":
                 try:
                     mp3 = tts.edge_file(speak, target, int(CFG["speed"]))
@@ -1185,12 +1274,16 @@ class Engine:
                     break
                 if seek_ok and i > 0:                            # оригинал ещё раз
                     self.app.ui(self.app.subs.show_sub, sub, "orig")
-                    self.fragment(ph.start, ph.end, None, tts, False)
+                    if not self.fragment(ph.start, ph.end, None, tts, False):
+                        seek_ok = False
                 self.wait(gap)                                   # пауза между фразой и переводом
                 self.app.ui(self.app.subs.show_sub, sub, "tr")
+                spoke = False
                 if seek_ok:                                      # тот же отрывок, но с голосом перевода
-                    self.fragment(ph.start, ph.end, (speak, mp3), tts, True)
-                else:                                            # перематывать нельзя: говорим на паузе
+                    spoke = self.fragment(ph.start, ph.end, (speak, mp3), tts, True)
+                    if not spoke:
+                        seek_ok = False
+                if not spoke:                                    # перематывать нельзя: говорим на паузе
                     if CFG["mute_original"]:
                         self.app.muter.mute()
                     tts.speak(speak, target, self.halt)
@@ -1199,8 +1292,7 @@ class Engine:
                 self.wait(gap)
             self.app.ui(self.app.subs.hide)
             if seek_ok and not self.hold.is_set():
-                self.guard(3.0)
-                media.seek(ph.end)
+                self.seek_to(ph.end, 1500)
         finally:
             self.app.muter.restore()
             if not self.hold.is_set():                           # на паузе пользователя видео не трогаем
@@ -1297,8 +1389,8 @@ class Engine:
         media = app.media
         st = media.info()
         if st is None or not st["seek"]:
-            app.ui(app.subs.flash, "Непрерывный режим: нужен плеер с перемоткой (YouTube в Chrome или Edge). "
-                                   "Включён обычный режим.", 6000)
+            app.ui(app.subs.flash, "Непрерывный режим: нужен плеер с перемоткой. Установите расширение Babelo в Chrome или Edge "
+                                   "(YouTube и другие сайты) либо откройте файл в проигрывателе Babelo. Включён обычный режим.", 8000)
             CFG["mode"] = "live"
             save_settings()
             app.ui(app.sync_ui)
@@ -1354,10 +1446,8 @@ class Engine:
         if start_at is not None:
             cur = media.position_ms()
             if cur is not None and abs(cur - start_at) > 800:
-                self.guard(3.0)
-                media.seek(start_at)
-                media.wait_near(start_at)
-                self.guard(1.5)
+                if not self.seek_to(start_at, 1500):
+                    raise RuntimeError("перемотка видео не сработала")
             p0 = start_at
         else:
             p0 = media.position_ms() or 0
@@ -1408,10 +1498,8 @@ class Engine:
         self.gate = True
         app.muter.mute()                                           # оригинал выключен, остаётся только голос перевода
         app.ui(app.subs.hide)
-        self.guard(4.0)
-        media.seek(p0)
-        media.wait_near(p0)
-        self.guard(1.5)
+        if not self.seek_to(p0, 1500):
+            raise RuntimeError("перемотка видео не сработала: вернуться к началу отрезка не удалось")
         app.ui(app.banner_idle)
         # --- 3. показ с переводом; фразы, которые ещё доделываются, берутся по мере готовности
         t_play, last, shown = 0.0, time.time(), None
@@ -1917,6 +2005,9 @@ class LocalServer:
                     body = json.loads(self.rfile.read(n) or b"{}")
                     if self.path == "/translate":
                         self._send(200, outer.translate(body))
+                    elif self.path == "/media/state":
+                        cmd = BRIDGE.update(body)
+                        self._send(200, {"cmd": cmd, "session": BRIDGE.session})
                     elif self.path == "/reverse":
                         HUB.load_nllb(int(CFG["threads"]))
                         self._send(200, {"word": HUB.reverse_word(str(body.get("word", ""))[:80], body["src"], body["tgt"])})
@@ -2841,7 +2932,11 @@ class App:
             else:
                 sound = "звук идёт" if time.time() - e.last_loud < 2 else "тихо (включите видео или музыку)"
             s = e.stats
-            player = "плеер найден" if self.media.available() else "плеер не найден"
+            if self.media.available():
+                player = "плеер: %s%s" % ("расширение браузера" if self.media.src == "ext" else "Windows",
+                                          "" if self.media.can_seek() else ", без перемотки")
+            else:
+                player = "плеер не найден"
             txt = "Перевод включён · слышу: %s · %s · фраз услышано %d, распознано %d, переведено %d, озвучено %d, ошибок %d" % (
                 sound, player, s["heard"], s["recognised"], s["translated"], s["spoken"], s["errors"])
         self.stats_lbl.config(text=txt)

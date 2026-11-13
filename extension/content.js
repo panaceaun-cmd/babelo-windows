@@ -581,6 +581,30 @@
     else if (e.key === "Escape" && active && CFG.esc_stops) stop();
   }, true);
 
+  // ------------------------------------------------------------------ мост к программе Babelo
+  // Если программа Babelo запущена, она получает отсюда точную позицию видео и может его перематывать (пауза/пуск/перемотка).
+  let bridgeNext = 0, lastCmd = 0, bridgeSession = null;
+  async function bridgeTick() {
+    if (closed || Date.now() < bridgeNext || document.visibilityState !== "visible") return;
+    const v = active && video ? video : pickVideo();
+    if (!v) return;
+    const body = { pos: v.currentTime, playing: !v.paused && !v.ended, rate: v.playbackRate, ack: lastCmd,
+      seek: isFinite(v.duration) && v.duration > 0 && !!(v.seekable && v.seekable.length) };
+    const r = await bg({ type: "local", path: "/media/state", body });
+    if (!r.ok || !r.data) { bridgeNext = Date.now() + 3000; return; }
+    if (r.data.session !== bridgeSession) { bridgeSession = r.data.session; lastCmd = 0; }
+    const c = r.data.cmd;
+    if (c && c.id > lastCmd) {
+      lastCmd = c.id;
+      ours.pause = ours.seek = Date.now() + 1500;
+      if (c.type === "play") v.play().catch(() => {});
+      else if (c.type === "pause") v.pause();
+      else if (c.type === "seek" && typeof c.t === "number") v.currentTime = c.t;
+      setTimeout(bridgeTick, 60);
+    }
+  }
+  setInterval(bridgeTick, 250);
+
   chrome.runtime.onMessage.addListener((m, s, send) => {
     if (m && m.type === "toggle") { if (active) stop(); else start(); send({ active }); }
     else if (m && m.type === "state") send({ active, status: statusText, closed });
