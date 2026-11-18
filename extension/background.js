@@ -1,4 +1,4 @@
-// Запросы к Babelo на этом же компьютере (127.0.0.1) идут из фонового скрипта: страницы сайтов туда не пускают.
+// Запросы к программе Babelo на этом же компьютере (127.0.0.1) идут отсюда: страницы сайтов туда не пускают.
 chrome.runtime.onMessage.addListener((msg, sender, send) => {
   if (msg && msg.type === "local") {
     fetch("http://127.0.0.1:47831" + msg.path, {
@@ -11,4 +11,5 @@ chrome.runtime.onMessage.addListener((msg, sender, send) => {
       .catch((e) => send({ ok: false, error: String(e) }));
     return true;
   }
+  if (msg && msg.type === "reload") { chrome.runtime.reload(); }
 });

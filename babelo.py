@@ -32,6 +32,7 @@ LOG_FILE = os.path.join(DATA, "babelo.log")
 SETTINGS_FILE = os.path.join(DATA, "settings.json")
 MUTED_FILE = os.path.join(DATA, "muted.json")
 MASTER_FILE = os.path.join(DATA, "master_muted.flag")
+EXT_DIR = os.path.join(DATA, "extension")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 # код языка: (название, код NLLB, основной код языка Windows, голоса Edge)
@@ -59,7 +60,7 @@ TEST_PHRASE = {"ru": "Привет! Это проверка голоса Babelo.
 DEFAULTS = {"target": "ru", "source": "auto", "whisper": "small", "phrase_sec": 5, "pause_ms": 400,
             "speed": 100, "volume": 100, "mute_original": True, "engine": "sapi", "voice": "", "threads": 4, "github_token": "",
             "mode": "live", "pause_s": 2, "repeats": 1, "block_sec": 60, "subs": "translated",
-            "esc_stops": True, "orig_vol": 15}
+            "esc_stops": True, "orig_vol": 15, "text_src": "auto", "ext_prompted": False}
 
 # ---------------------------------------------------------------- журнал и настройки
 LOG_LINES = []
@@ -719,6 +720,7 @@ class Bridge:
         self.cmds = []
         self.next_id = 1
         self.acked = 0
+        self.results = {}
         self.session = int(time.time() * 1000) % 1000000007
 
     def update(self, st):
@@ -736,12 +738,30 @@ class Bridge:
         with self.lock:
             return dict(self.state or {}), self.t
 
-    def send(self, typ, t=None):
+    def send(self, typ, t=None, extra=None):
         with self.lock:
             cid = self.next_id
             self.next_id += 1
-            self.cmds.append({"id": cid, "type": typ, "t": t})
+            cmd = {"id": cid, "type": typ, "t": t}
+            if extra:
+                cmd.update(extra)
+            self.cmds.append(cmd)
             return cid
+
+    def put_result(self, cid, data):
+        with self.lock:
+            self.results[cid] = data
+
+    def request(self, typ, payload=None, timeout=15.0):
+        """Команда расширению с ответом (например, получить субтитры видео)."""
+        cid = self.send(typ, None, payload or {})
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            with self.lock:
+                if cid in self.results:
+                    return self.results.pop(cid)
+            time.sleep(0.05)
+        return None
 
     def wait_ack(self, cid, timeout):
         t0 = time.time()
@@ -1546,6 +1566,8 @@ class Engine:
 import tkinter.font as tkfont
 
 BG = "#1c1c20"
+TEXT_SRC = [("auto", "Авто: субтитры видео, а если их нет — распознавание звука"),
+            ("captions", "Только субтитры видео (нужно расширение в браузере)"), ("sound", "Только распознавание звука")]
 MODES = [("live", "Обычный (по ходу)"),
          ("continuous", "Непрерывный: сначала подгрузка, потом только перевод"),
          ("interrupted", "Прерывистый: оригинал, потом тот же отрывок с переводом")]
@@ -1613,6 +1635,16 @@ def add_controls(parent, dark, app):
         app.on_mode_changed()
     cm.bind("<<ComboboxSelected>>", pick_mode)
     refresh.append(lambda: cm.set(label_of(MODES, CFG["mode"])))
+
+    lab("Откуда брать текст для перевода")
+    ct = ttk.Combobox(parent, state="readonly", values=[t for _, t in TEXT_SRC])
+    ct.pack(fill="x", padx=12)
+
+    def pick_text(_=None):
+        CFG["text_src"] = key_of(TEXT_SRC, ct.get())
+        save_settings()
+    ct.bind("<<ComboboxSelected>>", pick_text)
+    refresh.append(lambda: ct.set(label_of(TEXT_SRC, CFG["text_src"])))
 
     var = tk.BooleanVar()
     ckw = dict(selectcolor="#333", activebackground=BG, activeforeground="white", **kw) if dark else {}
@@ -1955,6 +1987,27 @@ class Menu:
             except Exception:
                 pass
 
+# ---------------------------------------------------------------- расширение браузера: файлы и версия
+def ext_version(path=None):
+    try:
+        with open(os.path.join(path or EXT_DIR, "manifest.json"), encoding="utf-8") as f:
+            return json.load(f).get("version", "")
+    except Exception:
+        return ""
+
+def install_extension_files():
+    """Кладёт актуальные файлы расширения в %LOCALAPPDATA%\\Babelo\\extension (при установке и обновлении программы)."""
+    import shutil
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    for src in (os.path.join(getattr(sys, "_MEIPASS", ""), "extension"), os.path.join(exe_dir, "extension"),
+                os.path.join(exe_dir, "_internal", "extension"), os.path.join(os.path.dirname(os.path.abspath(__file__)), "extension")):
+        if os.path.exists(os.path.join(src, "manifest.json")):
+            if ext_version(src) != ext_version():
+                shutil.copytree(src, EXT_DIR, dirs_exist_ok=True)
+                log("файлы расширения браузера обновлены: %s (версия %s)" % (EXT_DIR, ext_version()))
+            return True
+    return False
+
 # ---------------------------------------------------------------- сервер для расширения браузера
 class LocalServer:
     """Расширение Chrome/Edge просит у Babelo перевод (NLLB) с выравниванием слов. Только 127.0.0.1."""
@@ -1994,7 +2047,7 @@ class LocalServer:
 
             def do_GET(self):
                 if self.path == "/ping":
-                    self._send(200, {"ok": True, "build": APP_BUILD,
+                    self._send(200, {"ok": True, "build": APP_BUILD, "ext": ext_version(),
                                      "models": os.path.exists(os.path.join(NLLB_DIR, "model.bin"))})
                 else:
                     self._send(404, {})
@@ -2007,7 +2060,10 @@ class LocalServer:
                         self._send(200, outer.translate(body))
                     elif self.path == "/media/state":
                         cmd = BRIDGE.update(body)
-                        self._send(200, {"cmd": cmd, "session": BRIDGE.session})
+                        self._send(200, {"cmd": cmd, "session": BRIDGE.session, "ext": ext_version()})
+                    elif self.path == "/media/result":
+                        BRIDGE.put_result(int(body.get("id", 0)), body.get("data"))
+                        self._send(200, {})
                     elif self.path == "/reverse":
                         HUB.load_nllb(int(CFG["threads"]))
                         self._send(200, {"word": HUB.reverse_word(str(body.get("word", ""))[:80], body["src"], body["tgt"])})
@@ -2091,12 +2147,74 @@ class Mpv:
         finally:
             self.h = None
 
-class FileSession:
-    """Проигрыватель файла с непрерывным переводом: звук читается вперёд быстрее реального времени,
-    перевод готов заранее, видео идёт без повторов. Режимы: обычный, непрерывный, прерывистый."""
-    def __init__(self, app, source):
+class MpvBackend:
+    """Управление видео в проигрывателе Babelo (libmpv)."""
+    def __init__(self, mpv):
+        self.m = mpv
+
+    def pos(self):
+        return self.m.getf("time-pos")
+
+    def paused(self):
+        return self.m.get("pause") == "yes"
+
+    def set_pause(self, on):
+        self.m.set("pause", "yes" if on else "no")
+
+    def seek(self, sec):
+        self.m.command("seek", sec, "absolute+exact")
+        time.sleep(0.15)
+        return True
+
+    def volume(self, v):
+        self.m.set("volume", int(v))
+
+    def rate(self):
+        return self.m.getf("speed") or 1.0
+
+    def restore(self):
+        pass
+
+class BridgeBackend:
+    """Управление видео на странице в браузере через расширение Babelo."""
+    def __init__(self, media):
+        self.media = media
+
+    def pos(self):
+        p = self.media.position_ms()
+        return None if p is None else p / 1000.0
+
+    def paused(self):
+        st = self.media.info()
+        return st is None or not st["playing"]
+
+    def set_pause(self, on):
+        if on:
+            self.media.pause()
+        else:
+            self.media.play()
+
+    def seek(self, sec):
+        ms = int(sec * 1000)
+        self.media.seek(ms)
+        return self.media.wait_near(ms, 3.0, 900)
+
+    def volume(self, v):
+        BRIDGE.send("volume", None, {"v": None if v is None else v / 100.0})
+
+    def rate(self):
+        st = self.media.info()
+        return (st or {}).get("rate") or 1.0
+
+    def restore(self):
+        BRIDGE.send("volume", None, {"v": None})
+
+class ItemPlayer:
+    """Общая часть проигрывателя файла и перевода по субтитрам видео: переведённые фразы готовятся ВПЕРЁД,
+    видео идёт без повторов. Режимы: обычный, непрерывный, прерывистый."""
+    def init_player(self, app, be):
         self.app = app
-        self.source = source
+        self.be = be
         self.stop_evt = threading.Event()
         self.lock = threading.Lock()
         self.items = {}
@@ -2104,18 +2222,315 @@ class FileSession:
         self.cov = []
         self.done = False
         self.duration = 0.0
-        self.audio = None
         self.pipe_id = 0
         self.last_restart = 0.0
         self.buffering = True
+        self.elastic = False
         self.guard_until = 0.0
         self.closed = False
         self.error = None
         self.status = "Подготовка перевода…"
         self.src_lang = "…"
+
+    def guard(self, sec=1.5):
+        self.guard_until = time.time() + sec
+
+    # --- покрытие: какие участки уже переведены
+    def extend_cov(self, a, b):
+        with self.lock:
+            for iv in self.cov:
+                if iv[0] - 0.5 <= a <= iv[1] + 0.5:
+                    iv[0] = min(iv[0], a)
+                    iv[1] = max(iv[1], b)
+                    return
+            self.cov.append([a, b])
+
+    def in_cov(self, pos):
+        with self.lock:
+            return any(iv[0] - 0.6 <= pos <= iv[1] for iv in self.cov)
+
+    def covered(self, pos, lead):
+        with self.lock:
+            return any(iv[0] - 0.6 <= pos and (iv[1] >= pos + lead or (self.duration and iv[1] >= self.duration - 0.5))
+                       for iv in self.cov)
+
+    def restart_pipeline(self, from_s):
+        raise NotImplementedError
+
+    def add_segment(self, s0, s1, text, frm, tts):
+        target = CFG["target"]
+        sents = HUB._sentences(text) or [text]
+        lens = [max(1, len(s)) for s in sents]
+        total = float(sum(lens))
+        t = s0
+        for s, ln in zip(sents, lens):
+            a, b = t, t + (s1 - s0) * ln / total
+            t = b
+            try:
+                tr, pairs = HUB.translate_aligned(s, frm, target)
+            except Exception as e:
+                log("перевод фразы: %s" % e)
+                continue
+            speak = clean_text(tr)[:500]
+            if not any(c.isalpha() for c in speak):
+                continue
+            win = max(1.0, b - a + 0.8)
+            pct = int(min(220, max(int(CFG["speed"]), len(speak) / (13.0 * win) * 100)))
+            mp3 = None
+            if CFG["engine"] == "edge":
+                try:
+                    mp3 = tts.edge_file(speak, target, pct)
+                except Exception as e:
+                    log("Edge: %s" % e)
+            sub = {"orig": s, "tr": tr, "pairs": pairs, "frm": frm, "to": target}
+            it = Item(int(a * 1000), int(b * 1000), sub, speak, mp3, pct)
+            with self.lock:
+                self.items[it.start] = it
+                self.ver += 1
+
+    def wait(self, sec):
+        t0 = time.time()
+        while time.time() - t0 < sec and not self.stop_evt.is_set():
+            time.sleep(0.05)
+
+    def play_until(self, end_s, timeout):
+        t0 = time.time()
+        while not self.stop_evt.is_set() and time.time() - t0 < timeout:
+            p = self.be.pos()
+            if p is not None and p >= end_s:
+                break
+            time.sleep(0.03)
+
+    def seek_failed(self):
+        log("перемотка видео не сработала")
+        self.app.ui(self.app.banner.status, "Перемотка видео не сработала — повтор отрывка пропущен")
+
+    def run_interrupted(self, it, tts):
+        be, app = self.be, self.app
+        target = CFG["target"]
+        n = max(1, int(CFG["repeats"]))
+        gap = float(CFG["pause_s"])
+        st, en = it.start / 1000.0, it.end / 1000.0
+        self.guard(6)
+        be.set_pause(True)
+        for r in range(n):
+            if self.stop_evt.is_set():
+                break
+            if r > 0:                                                   # оригинал ещё раз
+                app.ui(app.subs.show_sub, it.sub, "orig")
+                self.guard(4)
+                be.volume(100)
+                if not be.seek(st):
+                    self.seek_failed()
+                    break
+                be.set_pause(False)
+                self.play_until(en, en - st + 4)
+                be.set_pause(True)
+            self.wait(gap)                                              # пауза между фразой и переводом
+            app.ui(app.subs.show_sub, it.sub, "tr")
+            self.guard(4)
+            be.volume(0 if CFG["mute_original"] else 100)
+            if not be.seek(st):
+                self.seek_failed()
+                break
+            try:
+                tts.say_now(it.speak, target, it.pct, it.mp3)
+            except Exception as e:
+                log("озвучка: %s" % e)
+            be.set_pause(False)
+            self.play_until(en, en - st + 4)
+            be.set_pause(True)
+            tts.wait_done(self.stop_evt, 40)
+            be.volume(100)
+            self.wait(gap)
+        app.ui(app.subs.hide)
+        self.guard(4)
+        be.seek(en)
+        be.set_pause(False)
+
+    def play_loop(self):
+        com_init()
+        tts = Tts()
+        be, app = self.be, self.app
+        items, starts, ptr, last_ver = [], [], 0, -1
+        last_pos, last_t, shown = None, time.time(), None
+        elastic_t, last_status, vol_set = 0.0, None, None
+        while not self.stop_evt.is_set():
+            time.sleep(0.04)
+            try:
+                pos = be.pos()
+                if pos is None:
+                    if self.error:
+                        app.ui(app.banner.status, "Ошибка: %s" % self.error)
+                        time.sleep(0.5)
+                    continue
+                now = time.time()
+                paused = be.paused()
+                mode = CFG["mode"]
+                if last_ver != self.ver:
+                    with self.lock:
+                        items = sorted(self.items.values(), key=lambda x: x.start)
+                    starts = [i.start for i in items]
+                    last_ver = self.ver
+                    ptr = bisect.bisect_left(starts, int(pos * 1000) - 250)
+                if last_pos is not None and now > self.guard_until:       # перемотка пользователя
+                    expected = last_pos if (paused or self.buffering) else last_pos + (now - last_t) * be.rate()
+                    if abs(pos - expected) > 1.5:
+                        tts.stop_now()
+                        app.ui(app.subs.hide)
+                        shown = None
+                        ptr = bisect.bisect_left(starts, int(pos * 1000) - 250)
+                        if not self.in_cov(pos) and now - self.last_restart > 2:
+                            self.restart_pipeline(pos)
+                last_pos, last_t = pos, now
+                # --- запас вперёд: без готового перевода видео ждёт
+                lead = max(3, min(int(CFG["block_sec"]), 60))
+                if not self.done and not self.error:
+                    if not self.covered(pos, 1.0):
+                        if not self.buffering:
+                            self.buffering = True
+                            self.guard(2.0)
+                            be.set_pause(True)
+                            tts.stop_now()
+                        if not self.in_cov(pos) and now - self.last_restart > 3:
+                            self.restart_pipeline(pos)
+                    elif self.buffering and self.covered(pos, lead):
+                        self.buffering = False
+                        self.guard(2.0)
+                        be.set_pause(False)
+                elif self.buffering and (self.done or self.error):
+                    self.buffering = False
+                    self.guard(2.0)
+                    be.set_pause(False)
+                if self.buffering:
+                    with self.lock:
+                        top = max([iv[1] for iv in self.cov] or [0.0])
+                    pct = int(top * 100 / self.duration) if self.duration else 0
+                    text = "%s %d %%" % (self.status if not self.cov else "Подготовка перевода", pct)
+                else:
+                    text = None
+                if text != last_status:
+                    last_status = text
+                    app.ui(app.banner.status, text)
+                if self.buffering:
+                    continue
+                if paused and not self.elastic:                              # пользователь на паузе: перевод ждёт
+                    tts.stop_now()
+                    continue
+                target = CFG["target"]
+                if mode == "interrupted":
+                    if vol_set != 100:
+                        be.volume(100)
+                        vol_set = 100
+                    if ptr < len(items) and pos * 1000 >= items[ptr].end:
+                        it = items[ptr]
+                        ptr += 1
+                        if pos * 1000 - it.end < 800:
+                            self.run_interrupted(it, tts)
+                            last_pos = None
+                    continue
+                v = int(CFG["orig_vol"]) if (mode == "live" and CFG["mute_original"]) else (0 if mode == "continuous" or CFG["mute_original"] else 100)
+                if vol_set != v:
+                    be.volume(v)
+                    vol_set = v
+                while ptr < len(items) and pos * 1000 >= items[ptr].start - 250:
+                    it = items[ptr]
+                    ptr += 1
+                    if pos * 1000 <= it.end + 1500:
+                        shown = it
+                        app.ui(app.subs.show_sub, it.sub, "tr")
+                        try:
+                            tts.say_now(it.speak, target, int(min(220, it.pct * max(1.0, be.rate()))), it.mp3)   # видео ускорено — речь тоже
+                        except Exception as e:
+                            log("озвучка: %s" % e)
+                if shown is not None and pos * 1000 > shown.end + 200:
+                    if tts.busy():                                          # речь длиннее фразы: видео чуть ждёт
+                        if not self.elastic:
+                            self.elastic, elastic_t = True, now
+                            self.guard(2.0)
+                            be.set_pause(True)
+                        elif now - elastic_t > 6:
+                            tts.stop_now()
+                    else:
+                        if self.elastic:
+                            self.elastic = False
+                            self.guard(2.0)
+                            be.set_pause(False)
+                        app.ui(app.subs.hide)
+                        shown = None
+            except Exception as e:
+                log("воспроизведение: %s" % e)
+                time.sleep(0.3)
+        tts.stop_now()
+
+class CaptionSession(ItemPlayer):
+    """Перевод по субтитрам видео из браузера: субтитры известны заранее, перевод готовится вперёд, видео идёт без повторов.
+    Расширение отдаёт субтитры и управляет видео, вся озвучка, субтитры и меню — в программе Babelo."""
+    def __init__(self, app, cues, lang):
+        self.init_player(app, BridgeBackend(app.media))
+        self.cues = sorted([c for c in cues if not c.get("skip")], key=lambda c: c["start"])
+        self.src_lang = lang
+        self.duration = max([c["end"] for c in self.cues] or [0.0]) + 1.0
+        self.status = "Перевожу субтитры вперёд…"
+        start = self.be.pos() or 0.0
+        self.guard(3.0)
+        self.be.set_pause(True)                                 # видео ждёт, пока готов первый запас перевода
+        threading.Thread(target=self.pipeline, args=(max(0.0, start - 1.0), self.pipe_id), daemon=True).start()
+        threading.Thread(target=self.play_loop, daemon=True).start()
+
+    def restart_pipeline(self, from_s):
+        self.pipe_id += 1
+        self.last_restart = time.time()
+        threading.Thread(target=self.pipeline, args=(max(0.0, from_s - 1.0), self.pipe_id), daemon=True).start()
+
+    def pipeline(self, from_s, pid):
+        try:
+            if self.src_lang not in LANGS:
+                raise RuntimeError("язык видео «%s» не поддерживается" % self.src_lang)
+            if self.src_lang == CFG["target"]:
+                raise RuntimeError("язык видео уже совпадает с языком перевода")
+            HUB.load_nllb(int(CFG["threads"]))
+            com_init()
+            tts = Tts()
+            for c in self.cues:
+                if c["end"] < from_s - 0.5:
+                    continue
+                if self.stop_evt.is_set() or pid != self.pipe_id:
+                    return
+                self.add_segment(c["start"], c["end"], c["text"], self.src_lang, tts)
+                self.extend_cov(from_s, c["end"])
+            self.extend_cov(from_s, self.duration + 1.0)
+            if from_s <= 1.0:
+                self.done = True
+            self.status = "Перевод готов"
+        except Exception as e:
+            self.error = str(e)
+            log("субтитры: %s" % e)
+            log(traceback.format_exc())
+            self.app.ui(self.app.subs.flash, "Субтитры: %s" % str(e)[:100], 6000)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.stop_evt.set()
+        try:
+            self.be.restore()
+            if self.buffering or self.elastic:
+                self.be.set_pause(False)                       # не оставляем видео на паузе
+        except Exception:
+            pass
+
+class FileSession(ItemPlayer):
+    """Проигрыватель файла: звук читается вперёд быстрее реального времени (Whisper), перевод готов заранее."""
+    def __init__(self, app, source):
+        self.source = source
+        self.audio = None
         self.dragging = False
+        self.app = app
         self._build_window()
         self.mpv = Mpv(self.vid.winfo_id())
+        self.init_player(app, MpvBackend(self.mpv))
         self.mpv.command("loadfile", source)
         self.mpv.set("pause", "yes")
         self.mpv.set("volume", 0)
@@ -2153,7 +2568,7 @@ class FileSession:
     def toggle_pause(self):
         if self.buffering:
             return
-        self.mpv.set("pause", "no" if self.mpv.get("pause") == "yes" else "yes")
+        self.be.set_pause(not self.be.paused())
 
     def _seek_release(self, _e):
         self.dragging = False
@@ -2175,9 +2590,6 @@ class FileSession:
         except Exception:
             pass
 
-    def guard(self, sec=1.5):
-        self.guard_until = time.time() + sec
-
     def close(self):
         if self.closed:
             return
@@ -2192,61 +2604,10 @@ class FileSession:
         except Exception:
             pass
 
-    # --- покрытие: какие участки файла уже переведены
-    def extend_cov(self, a, b):
-        with self.lock:
-            for iv in self.cov:
-                if iv[0] - 0.5 <= a <= iv[1] + 0.5:
-                    iv[0] = min(iv[0], a)
-                    iv[1] = max(iv[1], b)
-                    return
-            self.cov.append([a, b])
-
-    def in_cov(self, pos):
-        with self.lock:
-            return any(iv[0] - 0.6 <= pos <= iv[1] for iv in self.cov)
-
-    def covered(self, pos, lead):
-        with self.lock:
-            return any(iv[0] - 0.6 <= pos and (iv[1] >= pos + lead or (self.duration and iv[1] >= self.duration - 0.5))
-                       for iv in self.cov)
-
     def restart_pipeline(self, from_s):
         self.pipe_id += 1
         self.last_restart = time.time()
         threading.Thread(target=self.pipeline, args=(max(0.0, from_s - 1.0), self.pipe_id), daemon=True).start()
-
-    # --- чтение вперёд: распознать -> перевести -> (озвучить заранее для Edge)
-    def add_segment(self, s0, s1, text, frm, tts):
-        target = CFG["target"]
-        sents = HUB._sentences(text) or [text]
-        lens = [max(1, len(s)) for s in sents]
-        total = float(sum(lens))
-        t = s0
-        for s, ln in zip(sents, lens):
-            a, b = t, t + (s1 - s0) * ln / total
-            t = b
-            try:
-                tr, pairs = HUB.translate_aligned(s, frm, target)
-            except Exception as e:
-                log("перевод фразы: %s" % e)
-                continue
-            speak = clean_text(tr)[:500]
-            if not any(c.isalpha() for c in speak):
-                continue
-            win = max(1.0, b - a + 0.8)
-            pct = int(min(220, max(int(CFG["speed"]), len(speak) / (13.0 * win) * 100)))
-            mp3 = None
-            if CFG["engine"] == "edge":
-                try:
-                    mp3 = tts.edge_file(speak, target, pct)
-                except Exception as e:
-                    log("Edge: %s" % e)
-            sub = {"orig": s, "tr": tr, "pairs": pairs, "frm": frm, "to": target}
-            it = Item(int(a * 1000), int(b * 1000), sub, speak, mp3, pct)
-            with self.lock:
-                self.items[it.start] = it
-                self.ver += 1
 
     def pipeline(self, from_s, pid):
         try:
@@ -2293,171 +2654,6 @@ class FileSession:
             log(traceback.format_exc())
             self.app.ui(self.app.subs.flash, "Файл: %s" % str(e)[:100], 6000)
 
-    # --- воспроизведение
-    def wait(self, sec):
-        t0 = time.time()
-        while time.time() - t0 < sec and not self.stop_evt.is_set():
-            time.sleep(0.05)
-
-    def play_until(self, end_s, timeout):
-        t0 = time.time()
-        while not self.stop_evt.is_set() and time.time() - t0 < timeout:
-            p = self.mpv.getf("time-pos")
-            if p is not None and p >= end_s:
-                break
-            time.sleep(0.03)
-
-    def run_interrupted(self, it, tts):
-        mpv, app = self.mpv, self.app
-        target = CFG["target"]
-        n = max(1, int(CFG["repeats"]))
-        gap = float(CFG["pause_s"])
-        st, en = it.start / 1000.0, it.end / 1000.0
-        self.guard(6)
-        mpv.set("pause", "yes")
-        for r in range(n):
-            if self.stop_evt.is_set():
-                break
-            if r > 0:                                                   # оригинал ещё раз
-                app.ui(app.subs.show_sub, it.sub, "orig")
-                self.guard(4)
-                mpv.set("volume", 100)
-                mpv.command("seek", st, "absolute+exact")
-                time.sleep(0.15)
-                mpv.set("pause", "no")
-                self.play_until(en, en - st + 4)
-                mpv.set("pause", "yes")
-            self.wait(gap)                                              # пауза между фразой и переводом
-            app.ui(app.subs.show_sub, it.sub, "tr")
-            self.guard(4)
-            mpv.set("volume", 0 if CFG["mute_original"] else 100)
-            mpv.command("seek", st, "absolute+exact")
-            time.sleep(0.15)
-            try:
-                tts.say_now(it.speak, target, it.pct, it.mp3)
-            except Exception as e:
-                log("озвучка: %s" % e)
-            mpv.set("pause", "no")
-            self.play_until(en, en - st + 4)
-            mpv.set("pause", "yes")
-            tts.wait_done(self.stop_evt, 40)
-            mpv.set("volume", 100)
-            self.wait(gap)
-        app.ui(app.subs.hide)
-        self.guard(4)
-        mpv.command("seek", en, "absolute+exact")
-        mpv.set("pause", "no")
-
-    def play_loop(self):
-        com_init()
-        tts = Tts()
-        mpv, app = self.mpv, self.app
-        items, starts, ptr, last_ver = [], [], 0, -1
-        last_pos, last_t, shown = None, time.time(), None
-        elastic, elastic_t, last_status, vol_set = False, 0.0, None, None
-        while not self.stop_evt.is_set():
-            time.sleep(0.04)
-            try:
-                pos = mpv.getf("time-pos")
-                if pos is None:
-                    if self.error:
-                        app.ui(app.banner.status, "Ошибка: %s" % self.error)
-                        time.sleep(0.5)
-                    continue
-                now = time.time()
-                paused = mpv.get("pause") == "yes"
-                mode = CFG["mode"]
-                if last_ver != self.ver:
-                    with self.lock:
-                        items = sorted(self.items.values(), key=lambda x: x.start)
-                    starts = [i.start for i in items]
-                    last_ver = self.ver
-                    ptr = bisect.bisect_left(starts, int(pos * 1000) - 250)
-                if last_pos is not None and now > self.guard_until:       # перемотка пользователя
-                    expected = last_pos if (paused or self.buffering) else last_pos + (now - last_t)
-                    if abs(pos - expected) > 1.5:
-                        tts.stop_now()
-                        app.ui(app.subs.hide)
-                        shown = None
-                        ptr = bisect.bisect_left(starts, int(pos * 1000) - 250)
-                        if not self.in_cov(pos) and now - self.last_restart > 2:
-                            self.restart_pipeline(pos)
-                last_pos, last_t = pos, now
-                # --- запас вперёд: без готового перевода видео ждёт
-                lead = max(3, min(int(CFG["block_sec"]), 60))
-                if not self.done and not self.error:
-                    if not self.covered(pos, 1.0):
-                        if not self.buffering:
-                            self.buffering = True
-                            mpv.set("pause", "yes")
-                            tts.stop_now()
-                        if not self.in_cov(pos) and now - self.last_restart > 3 and self.audio is not None:
-                            self.restart_pipeline(pos)
-                    elif self.buffering and self.covered(pos, lead):
-                        self.buffering = False
-                        mpv.set("pause", "no")
-                elif self.buffering and (self.done or self.error):
-                    self.buffering = False
-                    mpv.set("pause", "no")
-                if self.buffering:
-                    with self.lock:
-                        top = max([iv[1] for iv in self.cov] or [0.0])
-                    pct = int(top * 100 / self.duration) if self.duration else 0
-                    text = "%s %d %%" % (self.status if not self.cov else "Подготовка перевода", pct)
-                else:
-                    text = None
-                if text != last_status:
-                    last_status = text
-                    app.ui(app.banner.status, text)
-                if self.buffering:
-                    continue
-                if paused and not elastic:                                   # пользователь на паузе: перевод ждёт
-                    tts.stop_now()
-                    continue
-                target = CFG["target"]
-                if mode == "interrupted":
-                    if vol_set != 100:
-                        mpv.set("volume", 100)
-                        vol_set = 100
-                    if ptr < len(items) and pos * 1000 >= items[ptr].end:
-                        it = items[ptr]
-                        ptr += 1
-                        if pos * 1000 - it.end < 800:
-                            self.run_interrupted(it, tts)
-                            last_pos = None
-                    continue
-                v = int(CFG["orig_vol"]) if (mode == "live" and CFG["mute_original"]) else (0 if mode == "continuous" or CFG["mute_original"] else 100)
-                if vol_set != v:
-                    mpv.set("volume", v)
-                    vol_set = v
-                while ptr < len(items) and pos * 1000 >= items[ptr].start - 250:
-                    it = items[ptr]
-                    ptr += 1
-                    if pos * 1000 <= it.end + 1500:
-                        shown = it
-                        app.ui(app.subs.show_sub, it.sub, "tr")
-                        try:
-                            tts.say_now(it.speak, target, it.pct, it.mp3)
-                        except Exception as e:
-                            log("озвучка: %s" % e)
-                if shown is not None and pos * 1000 > shown.end + 200:
-                    if tts.busy():                                          # речь длиннее фразы: видео чуть ждёт
-                        if not elastic:
-                            elastic, elastic_t = True, now
-                            mpv.set("pause", "yes")
-                        elif now - elastic_t > 6:
-                            tts.stop_now()
-                    else:
-                        if elastic:
-                            elastic = False
-                            mpv.set("pause", "no")
-                        app.ui(app.subs.hide)
-                        shown = None
-            except Exception as e:
-                log("проигрыватель: %s" % e)
-                time.sleep(0.3)
-        tts.stop_now()
-
 # ---------------------------------------------------------------- программа
 class App:
     def __init__(self):
@@ -2483,6 +2679,11 @@ class App:
         self.menu = Menu(self)
         self.hk_tid = None
         self.filesess = None
+        self.starting = False
+        try:
+            install_extension_files()
+        except Exception as e:
+            log("расширение: %s" % e)
         self.server = LocalServer()
         self.server.start()
         self.hidden_note = False
@@ -2495,6 +2696,7 @@ class App:
         self.refresh_models_state()
         self.root.after(1000, self._tick)
         self.root.after(4000, lambda: self.check_updates(True))      # тихая проверка обновлений при запуске
+        self.root.after(9000, self._maybe_prompt_ext)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_main)
         threading.Thread(target=self._hotkey, daemon=True).start()
         self.root.after(50, self._poll)
@@ -2584,6 +2786,50 @@ class App:
         if self.release_job:
             self.root.after_cancel(self.release_job)
             self.release_job = None
+        if self.starting:
+            return
+        want = CFG.get("text_src", "auto")
+        if want != "sound" and BRIDGE.fresh():                    # браузер подключён: сначала ищем субтитры видео
+            self.starting = True
+            self.banner.on(HINT)
+            self.banner.status("Ищу субтитры видео…")
+            if CFG.get("esc_stops"):
+                self.esc_hotkey(True)
+            self.set_status("Ищу субтитры видео в браузере…")
+            threading.Thread(target=self._find_captions, args=(want,), daemon=True).start()
+            return
+        if want == "captions":
+            self.set_status("Для перевода по субтитрам нужно расширение Babelo в браузере (кнопка «Установить расширение»).")
+            return
+        self.start_engine()
+
+    def _find_captions(self, want):
+        res = BRIDGE.request("captions", {"lang": None if CFG["source"] == "auto" else CFG["source"]}, 15.0)
+        self.ui(self._captions_ready, want, res)
+
+    def _captions_ready(self, want, res):
+        self.starting = False
+        if self.engine is not None or self.filesess is not None:
+            return
+        cues = res.get("cues") if isinstance(res, dict) else None
+        why = (res.get("error") if isinstance(res, dict) else None) or "расширение не ответило"
+        if cues:
+            try:
+                self.filesess = CaptionSession(self, cues, res.get("lang") or "en")
+                self.set_status("Перевод по субтитрам видео: перевод готовится вперёд, потом видео пойдёт без повторов. F10 — меню.")
+                return
+            except Exception as e:
+                why = str(e)
+                log(traceback.format_exc())
+        if want == "captions":
+            self.banner.hide()
+            self.esc_hotkey(False)
+            self.set_status("Субтитры не найдены: %s" % why)
+            return
+        self.set_status("Субтитров нет (%s) — перевожу по звуку." % why)
+        self.start_engine()
+
+    def start_engine(self):
         self.engine = Engine(self)
         self.engine.start()
         self.set_status("Перевод включён. F10 — меню, F10 два раза подряд — выключить.")
@@ -2592,7 +2838,41 @@ class App:
             self.esc_hotkey(True)
         self.on_mode_changed()
 
+    def install_extension(self):
+        """Расширение нельзя поставить в Chrome/Edge без участия пользователя: готовим папку и ведём по шагам."""
+        install_extension_files()
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(EXT_DIR)
+            self.root.update()
+        except Exception:
+            pass
+        chrome = messagebox.askyesno("Расширение для браузера",
+                                     "Папка расширения скопирована в буфер обмена:\n%s\n\nОткрыть страницу расширений в Google Chrome?\n"
+                                     "(Нет — открыть в Microsoft Edge)" % EXT_DIR)
+        url, exe = ("chrome://extensions", "chrome") if chrome else ("edge://extensions", "msedge")
+        try:
+            subprocess.Popen(["cmd", "/c", "start", "", exe, url], creationflags=0x08000000)
+        except Exception as e:
+            self.set_status("Не удалось открыть браузер: %s. Откройте %s вручную." % (e, url))
+        messagebox.showinfo("Установка расширения (один раз)",
+                            "1. Включите «Режим разработчика» (Chrome: справа вверху, Edge: слева внизу).\n"
+                            "2. Нажмите «Загрузить распакованное расширение».\n"
+                            "3. В окне выбора папки нажмите Ctrl+V (путь уже в буфере обмена), потом Enter и «Выбор папки».\n"
+                            "4. Обновите вкладку с видео (F5).\n\n"
+                            "Дальше расширение обновляется само вместе с программой.")
+
+    def _maybe_prompt_ext(self):
+        if BRIDGE.fresh() or CFG.get("ext_prompted") or self.root.state() == "withdrawn":
+            return
+        CFG["ext_prompted"] = True
+        save_settings()
+        if messagebox.askyesno("Babelo", "Установить расширение для браузера?\nОно нужно, чтобы переводить видео онлайн по субтитрам "
+                                         "(без повторов) и перематывать его. Сделать это сейчас?"):
+            self.install_extension()
+
     def stop(self):
+        self.starting = False
         had_engine = self.engine is not None
         if self.engine is not None:
             self.engine.stop()
@@ -2669,6 +2949,7 @@ class App:
         fb.pack(fill="x", padx=10, pady=(8, 2))
         ttk.Button(fb, text="Открыть видео/аудио файл (проигрыватель с непрерывным переводом)", command=self.pick_file).pack(side="left", padx=2)
         ttk.Button(fb, text="Открыть ссылку…", command=self.pick_url).pack(side="left", padx=2)
+        ttk.Button(fb, text="Установить расширение для браузера", command=self.install_extension).pack(side="left", padx=2)
         f = ttk.Frame(inner)
         f.pack(fill="x", padx=10, pady=4)
         names = [LANGS[c][0] for c in LANGS]
@@ -2925,7 +3206,7 @@ class App:
             fs = self.filesess
             txt = "Проигрыватель: %s · фраз переведено: %d · язык файла: %s" % (fs.status, len(fs.items), fs.src_lang)
         elif e is None:
-            txt = "Перевод выключен. F10 — включить."
+            txt = "Перевод выключен. F10 — включить. Расширение браузера: %s." % ("подключено" if BRIDGE.fresh() else "не подключено")
         else:
             if not e.listening:
                 sound = "подключаюсь к звуку компьютера…"
