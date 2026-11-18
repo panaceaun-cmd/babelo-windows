@@ -30,6 +30,7 @@ jobs:
           if ($dll) { $extra += "--add-binary"; $extra += ($dll.FullName + ";.") }
           $vk = Get-ChildItem libmpv -Recurse -Filter vulkan-1.dll -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($vk) { $extra += "--add-binary"; $extra += ($vk.FullName + ";.") }
+          if (Test-Path extension) { $extra += "--add-data"; $extra += "extension;extension" }
           pyinstaller --noconfirm --clean --onedir --windowed --name Babelo @extra --collect-all faster_whisper --collect-all ctranslate2 --collect-all tokenizers --collect-all av --collect-all onnxruntime --collect-all pyaudiowpatch --collect-all sentencepiece --collect-all edge_tts --collect-all pycaw --collect-all certifi --collect-all winsdk --hidden-import win32com.client --hidden-import pythoncom --hidden-import comtypes babelo.py
       - name: Zip
         run: |
