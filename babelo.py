@@ -464,22 +464,42 @@ def neural_id(lang):
             return mid
     return lst[0][1]
 
+def neural_root():
+    """Папка голосов. Нейроголос не читает пути с русскими буквами (имя пользователя Windows), поэтому тогда — C:\\Users\\Public."""
+    try:
+        NEURAL_DIR.encode("ascii")
+        return NEURAL_DIR
+    except UnicodeEncodeError:
+        return os.path.join(os.environ.get("PUBLIC") or r"C:\Users\Public", "Babelo", "voices")
+
 def neural_dir(mid):
-    return os.path.join(NEURAL_DIR, mid)
+    return os.path.join(neural_root(), mid)
+
+def _voice_ok(d, mid):
+    return (os.path.exists(os.path.join(d, mid + ".onnx")) and os.path.exists(os.path.join(d, "tokens.txt"))
+            and os.path.isdir(os.path.join(d, "espeak-ng-data")))
 
 def neural_ready(mid):
     d = neural_dir(mid)
-    return (os.path.exists(os.path.join(d, mid + ".onnx")) and os.path.exists(os.path.join(d, "tokens.txt"))
-            and os.path.isdir(os.path.join(d, "espeak-ng-data")))
+    if not _voice_ok(d, mid):
+        old = os.path.join(NEURAL_DIR, mid)
+        if neural_root() != NEURAL_DIR and _voice_ok(old, mid):          # голос скачан раньше в папку с русскими буквами
+            import shutil
+            try:
+                shutil.copytree(old, d, dirs_exist_ok=True)
+                log("голос %s перенесён в %s" % (mid, d))
+            except Exception as e:
+                log("перенос голоса: %s" % e)
+    return _voice_ok(d, mid)
 
 def download_neural(mid, progress, cancel):
     """Скачивает голос (архив ~60 МБ) с GitHub: с докачкой и прогрессом."""
     import requests, tarfile, shutil
     if neural_ready(mid):
         return
-    os.makedirs(NEURAL_DIR, exist_ok=True)
+    os.makedirs(neural_root(), exist_ok=True)
     url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-%s.tar.bz2" % mid
-    part = os.path.join(NEURAL_DIR, mid + ".tar.bz2.part")
+    part = os.path.join(neural_root(), mid + ".tar.bz2.part")
     title = "Голос %s" % mid
     attempts = 0
     while True:
@@ -518,7 +538,7 @@ def download_neural(mid, progress, cancel):
             log("обрыв связи при загрузке голоса: %s — продолжаю (попытка %d)" % (str(e)[:80], attempts))
             time.sleep(3)
     progress("%s: распаковываю…" % title, None)
-    tmp = os.path.join(NEURAL_DIR, "_unpack_" + mid)
+    tmp = os.path.join(neural_root(), "_unpack_" + mid)
     shutil.rmtree(tmp, ignore_errors=True)
     with tarfile.open(part, "r:bz2") as tf:
         base = os.path.realpath(tmp)
@@ -561,6 +581,9 @@ def neural_worker_main(port):
                     num_threads=int(req.get("threads", 2)), debug=False, provider="cpu"))
                 cache[d] = sherpa_onnx.OfflineTts(cfg)
             audio = cache[d].generate(req["text"], sid=int(req.get("sid", 0)), speed=float(req.get("speed", 1.0)))
+            if len(audio.samples) == 0 or int(audio.sample_rate) <= 0:
+                raise RuntimeError("голос не вернул звук (папка голоса: %s, файлы на месте: %s)" % (
+                    d, all(os.path.exists(os.path.join(d, n)) for n in (mid + ".onnx", "tokens.txt", "espeak-ng-data"))))
             x = np.clip(np.asarray(audio.samples, dtype=np.float32) * float(req.get("gain", 1.0)), -1.0, 1.0)
             with wave.open(req["out"], "wb") as w:
                 w.setnchannels(1)
