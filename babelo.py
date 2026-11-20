@@ -33,6 +33,24 @@ SETTINGS_FILE = os.path.join(DATA, "settings.json")
 MUTED_FILE = os.path.join(DATA, "muted.json")
 MASTER_FILE = os.path.join(DATA, "master_muted.flag")
 EXT_DIR = os.path.join(DATA, "extension")
+NEURAL_DIR = os.path.join(DATA, "voices")
+# Нейросетевые офлайн-голоса (Piper). Проверены: русские. Остальные — по каталогу Piper.
+NEURAL_VOICES = {
+    "ru": [("Ирина — женский (нейросеть, офлайн)", "ru_RU-irina-medium"), ("Денис — мужской (нейросеть, офлайн)", "ru_RU-denis-medium"),
+           ("Дмитрий — мужской (нейросеть, офлайн)", "ru_RU-dmitri-medium"), ("Руслан — мужской (нейросеть, офлайн)", "ru_RU-ruslan-medium")],
+    "en": [("Amy — женский (нейросеть, офлайн)", "en_US-amy-medium"), ("Ryan — мужской (нейросеть, офлайн)", "en_US-ryan-medium")],
+    "de": [("Thorsten — мужской (нейросеть, офлайн)", "de_DE-thorsten-medium"), ("Eva — женский (нейросеть, офлайн)", "de_DE-eva_k-x_low")],
+    "fr": [("Siwis — женский (нейросеть, офлайн)", "fr_FR-siwis-medium"), ("Tom — мужской (нейросеть, офлайн)", "fr_FR-tom-medium")],
+    "es": [("Davefx — мужской (нейросеть, офлайн)", "es_ES-davefx-medium")],
+    "it": [("Paola — женский (нейросеть, офлайн)", "it_IT-paola-medium"), ("Riccardo — мужской (нейросеть, офлайн)", "it_IT-riccardo-x_low")],
+    "pl": [("Gosia — женский (нейросеть, офлайн)", "pl_PL-gosia-medium"), ("Darkman — мужской (нейросеть, офлайн)", "pl_PL-darkman-medium")],
+    "uk": [("Украинский (нейросеть, офлайн)", "uk_UA-ukrainian_tts-medium")],
+    "tr": [("Fettah — мужской (нейросеть, офлайн)", "tr_TR-fettah-medium")],
+    "pt": [("Faber — мужской (нейросеть, офлайн)", "pt_BR-faber-medium")],
+    "zh": [("Huayan — женский (нейросеть, офлайн)", "zh_CN-huayan-medium")],
+}
+ENGINES = [("sapi", "Голос Windows (офлайн)"), ("neural", "Нейросеть (офлайн, заметно качественнее)"),
+           ("edge", "Edge (онлайн, лучшее качество)")]
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 # код языка: (название, код NLLB, основной код языка Windows, голоса Edge)
@@ -433,6 +451,191 @@ class ModelHub:
 
 HUB = ModelHub()
 
+# ---------------------------------------------------------------- нейросетевые голоса
+def neural_list(lang):
+    return NEURAL_VOICES.get(lang, [])
+
+def neural_id(lang):
+    lst = neural_list(lang)
+    if not lst:
+        return None
+    for label, mid in lst:
+        if label == CFG.get("voice"):
+            return mid
+    return lst[0][1]
+
+def neural_dir(mid):
+    return os.path.join(NEURAL_DIR, mid)
+
+def neural_ready(mid):
+    d = neural_dir(mid)
+    return (os.path.exists(os.path.join(d, mid + ".onnx")) and os.path.exists(os.path.join(d, "tokens.txt"))
+            and os.path.isdir(os.path.join(d, "espeak-ng-data")))
+
+def download_neural(mid, progress, cancel):
+    """Скачивает голос (архив ~60 МБ) с GitHub: с докачкой и прогрессом."""
+    import requests, tarfile, shutil
+    if neural_ready(mid):
+        return
+    os.makedirs(NEURAL_DIR, exist_ok=True)
+    url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-%s.tar.bz2" % mid
+    part = os.path.join(NEURAL_DIR, mid + ".tar.bz2.part")
+    title = "Голос %s" % mid
+    attempts = 0
+    while True:
+        if cancel.is_set():
+            raise Cancelled()
+        have = os.path.getsize(part) if os.path.exists(part) else 0
+        try:
+            hdr = {"User-Agent": "Babelo/2"}
+            if have:
+                hdr["Range"] = "bytes=%d-" % have
+            with requests.get(url, headers=hdr, stream=True, timeout=(20, 40), allow_redirects=True) as r:
+                if r.status_code == 416:
+                    break
+                r.raise_for_status()
+                if have and r.status_code != 206:
+                    have = 0
+                total = have + int(r.headers.get("Content-Length") or 0)
+                last = 0.0
+                with open(part, "ab" if have else "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        if cancel.is_set():
+                            raise Cancelled()
+                        f.write(chunk)
+                        have += len(chunk)
+                        if time.time() - last > 0.4:
+                            last = time.time()
+                            progress("%s: %d%% (%d из %d МБ)" % (title, have * 100 // max(total, 1), have >> 20, total >> 20),
+                                     have / float(max(total, 1)))
+            break
+        except Cancelled:
+            raise
+        except Exception as e:
+            attempts += 1
+            if attempts >= 6:
+                raise
+            log("обрыв связи при загрузке голоса: %s — продолжаю (попытка %d)" % (str(e)[:80], attempts))
+            time.sleep(3)
+    progress("%s: распаковываю…" % title, None)
+    tmp = os.path.join(NEURAL_DIR, "_unpack_" + mid)
+    shutil.rmtree(tmp, ignore_errors=True)
+    with tarfile.open(part, "r:bz2") as tf:
+        base = os.path.realpath(tmp)
+        for m in tf.getmembers():
+            if not os.path.realpath(os.path.join(tmp, m.name)).startswith(base):
+                raise RuntimeError("небезопасный архив голоса")
+        tf.extractall(tmp)
+    src = os.path.join(tmp, "vits-piper-" + mid)
+    if not os.path.isdir(src):
+        subs = os.listdir(tmp)
+        src = os.path.join(tmp, subs[0]) if subs else src
+    dst = neural_dir(mid)
+    shutil.rmtree(dst, ignore_errors=True)
+    os.replace(src, dst)
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        os.remove(part)
+    except OSError:
+        pass
+    if not neural_ready(mid):
+        raise RuntimeError("в архиве голоса нет нужных файлов")
+    progress("%s: готово ✓" % title, 1.0)
+
+def neural_worker_main(port):
+    """Отдельный процесс озвучки: sherpa-onnx живёт здесь, чтобы не конфликтовать с остальными моделями программы."""
+    import socket, wave
+    import sherpa_onnx
+    sock = socket.create_connection(("127.0.0.1", port))
+    f = sock.makefile("rwb")
+    cache = {}
+    for line in f:
+        try:
+            req = json.loads(line.decode("utf-8"))
+            d, mid = req["dir"], req["id"]
+            if d not in cache:
+                cfg = sherpa_onnx.OfflineTtsConfig(model=sherpa_onnx.OfflineTtsModelConfig(
+                    vits=sherpa_onnx.OfflineTtsVitsModelConfig(model=os.path.join(d, mid + ".onnx"), lexicon="",
+                                                               data_dir=os.path.join(d, "espeak-ng-data"),
+                                                               tokens=os.path.join(d, "tokens.txt")),
+                    num_threads=int(req.get("threads", 2)), debug=False, provider="cpu"))
+                cache[d] = sherpa_onnx.OfflineTts(cfg)
+            audio = cache[d].generate(req["text"], sid=int(req.get("sid", 0)), speed=float(req.get("speed", 1.0)))
+            x = np.clip(np.asarray(audio.samples, dtype=np.float32) * float(req.get("gain", 1.0)), -1.0, 1.0)
+            with wave.open(req["out"], "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(int(audio.sample_rate))
+                w.writeframes((x * 32767).astype("<i2").tobytes())
+            reply = {"ok": True}
+        except Exception as e:
+            reply = {"ok": False, "error": str(e)[:300]}
+        f.write((json.dumps(reply) + "\n").encode("utf-8"))
+        f.flush()
+
+class NeuralWorker:
+    """Клиент отдельного процесса озвучки. Запускается при первой фразе, закрывается вместе с программой."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc = None
+        self.f = None
+        self.sock = None
+
+    def close(self):
+        for o in (self.f, self.sock):
+            try:
+                o.close()
+            except Exception:
+                pass
+        self.f = self.sock = None
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        self.proc = None
+
+    def _start(self):
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--neural-worker", str(port)]
+        else:
+            cmd = [sys.executable, os.path.abspath(__file__), "--neural-worker", str(port)]
+        self.proc = subprocess.Popen(cmd, creationflags=0x08000000)
+        srv.settimeout(90)
+        self.sock, _ = srv.accept()
+        srv.close()
+        self.sock.settimeout(120)
+        self.f = self.sock.makefile("rwb")
+
+    def synth(self, d, mid, text, speed, gain, threads, out):
+        with self.lock:
+            for attempt in (1, 2):
+                try:
+                    if self.proc is None or self.proc.poll() is not None or self.f is None:
+                        self.close()
+                        self._start()
+                    req = {"dir": d, "id": mid, "text": text, "speed": speed, "gain": gain, "threads": threads, "out": out}
+                    self.f.write((json.dumps(req) + "\n").encode("utf-8"))
+                    self.f.flush()
+                    line = self.f.readline()
+                    if not line:
+                        raise OSError("процесс озвучки закрылся")
+                    r = json.loads(line.decode("utf-8"))
+                    if not r.get("ok"):
+                        raise RuntimeError(r.get("error") or "ошибка озвучки")
+                    return
+                except (OSError, ValueError) as e:
+                    self.close()
+                    if attempt == 2:
+                        raise RuntimeError("нейроголос: %s" % e)
+
+NEURAL = NeuralWorker()
+
 # ---------------------------------------------------------------- озвучка
 _mci = None
 
@@ -444,13 +647,18 @@ def mci(cmd):
     err = _mci(cmd, buf, 255, 0)
     return err, buf.value
 
-def play_mp3(path, volume, stop_evt):
-    alias = "bab%d" % (time.time_ns() % 10 ** 9)
-    err, _ = mci('open "%s" type mpegvideo alias %s' % (path, alias))
+def mci_open(path, alias, volume):
+    wav = path.lower().endswith(".wav")
+    err, _ = mci('open "%s" type %s alias %s' % (path, "waveaudio" if wav else "mpegvideo", alias))
     if err:
         raise RuntimeError("не удалось открыть звук (MCI %d)" % err)
-    try:
+    if not wav:
         mci("setaudio %s volume to %d" % (alias, max(0, min(1000, int(volume) * 10))))
+
+def play_mp3(path, volume, stop_evt):
+    alias = "bab%d" % (time.time_ns() % 10 ** 9)
+    mci_open(path, alias, volume)
+    try:
         mci("play " + alias)
         time.sleep(0.15)
         t0 = time.time()
@@ -468,10 +676,7 @@ def sapi_rate(pct):
 
 def play_mp3_async(path, volume):
     alias = "bab%d" % (time.time_ns() % 10 ** 9)
-    err, _ = mci('open "%s" type mpegvideo alias %s' % (path, alias))
-    if err:
-        raise RuntimeError("не удалось открыть звук (MCI %d)" % err)
-    mci("setaudio %s volume to %d" % (alias, max(0, min(1000, int(volume) * 10))))
+    mci_open(path, alias, volume)
     mci("play " + alias)
     return alias
 
@@ -536,9 +741,45 @@ class Tts:
         asyncio.run(gen())
         return path
 
+    def neural_file(self, text, lang, pct):
+        mid = neural_id(lang)
+        if not mid:
+            raise RuntimeError("для этого языка нет нейросетевого голоса")
+        if not neural_ready(mid):
+            raise RuntimeError("голос %s ещё не скачан" % mid)
+        path = os.path.join(tempfile.gettempdir(), "babelo_%d.wav" % time.time_ns())
+        gain = max(0.0, min(1.5, int(CFG["volume"]) / 100.0))
+        NEURAL.synth(neural_dir(mid), mid, text, max(0.5, min(2.5, int(pct) / 100.0)), gain, max(1, int(CFG["threads"]) // 2), path)
+        return path
+
+    def prefile(self, text, lang, pct):
+        """Звуковой файл заранее (Edge или нейроголос); None — говорит голос Windows."""
+        eng = CFG["engine"]
+        try:
+            if eng == "edge":
+                return self.edge_file(text, lang, pct)
+            if eng == "neural":
+                return self.neural_file(text, lang, pct)
+        except Exception as e:
+            log("озвучка (%s): %s" % (eng, e))
+        return None
+
     def speak(self, text, lang, stop_evt, pct=None):
         """Говорит и ждёт конца."""
         pct = int(pct or CFG["speed"])
+        if CFG["engine"] == "neural":
+            try:
+                path = self.neural_file(text, lang, pct)
+                try:
+                    play_mp3(path, int(CFG["volume"]), stop_evt)
+                finally:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+                return
+            except Exception as e:
+                log("Нейроголос недоступен (%s), говорю голосом Windows" % e)
         if CFG["engine"] == "edge":
             try:
                 path = self.edge_file(text, lang, pct)
@@ -1310,11 +1551,7 @@ class Engine:
             if not seek_ok:
                 self.notice("Нельзя перемотать видео назад (плеер: %s). Перевод звучит на паузе. Установите расширение Babelo "
                             "в браузер или откройте файл в проигрывателе Babelo." % ("расширение" if media.src == "ext" else "Windows"))
-            if CFG["engine"] == "edge":
-                try:
-                    mp3 = tts.edge_file(speak, target, int(CFG["speed"]))
-                except Exception as e:
-                    log("Edge: %s" % e)
+            mp3 = tts.prefile(speak, target, int(CFG["speed"]))
             for i in range(n):
                 if self.halt.is_set():
                     break
@@ -1363,12 +1600,7 @@ class Engine:
         sub, speak = made
         win = max(1.0, (ph.end - ph.start) / 1000.0)
         pct = int(min(220, max(int(CFG["speed"]), len(speak) / (13.0 * win) * 100)))   # успеть за окном фразы
-        mp3 = None
-        if CFG["engine"] == "edge":
-            try:
-                mp3 = tts.edge_file(speak, CFG["target"], pct)
-            except Exception as e:
-                log("Edge: %s" % e)
+        mp3 = tts.prefile(speak, CFG["target"], pct)
         self.items.append(Item(ph.start, ph.end, sub, speak, mp3, pct))
         if self.phase == 1 and self.silent_prep:                        # беззвучная подгрузка: перевод хотя бы в субтитрах
             self.app.ui(self.app.subs.show_sub, sub, "tr")
@@ -2328,12 +2560,7 @@ class ItemPlayer:
                 continue
             win = max(1.0, b - a + 0.8)
             pct = int(min(220, max(int(CFG["speed"]), len(speak) / (13.0 * win) * 100)))
-            mp3 = None
-            if CFG["engine"] == "edge":
-                try:
-                    mp3 = tts.edge_file(speak, target, pct)
-                except Exception as e:
-                    log("Edge: %s" % e)
+            mp3 = tts.prefile(speak, target, pct)
             sub = {"orig": s, "tr": tr, "pairs": pairs, "frm": frm, "to": target}
             it = Item(int(a * 1000), int(b * 1000), sub, speak, mp3, pct)
             with self.lock:
@@ -2771,6 +2998,8 @@ class App:
         self.filesess = None
         self.starting = False
         self.views = []
+        self.voice_thread = None
+        self.voice_cancel = threading.Event()
         try:
             st = ttk.Style(self.root)
             st.configure("D.TLabel", background=BG, foreground="white")
@@ -2878,6 +3107,7 @@ class App:
                 pass
 
     def start(self):
+        self.ensure_voice_async()
         if not HUB.ready(CFG["whisper"]):
             self.show_main()
             self.set_status("Сначала скачайте модели (кнопка «Скачать модели»), потом нажмите F10.")
@@ -3009,6 +3239,7 @@ class App:
             self.muter.restore()
             self.master.set(False)
             self.subs.hide()
+            NEURAL.close()
             self.root.destroy()
         finally:
             os._exit(0)
@@ -3060,7 +3291,7 @@ class App:
         V.v_src = tk.StringVar(value="Авто" if CFG["source"] == "auto" else LANGS.get(CFG["source"], ("Авто",))[0])
         V.v_dst = tk.StringVar(value=LANGS[CFG["target"]][0])
         V.v_whisper = tk.StringVar(value=CFG["whisper"])
-        V.v_engine = tk.StringVar(value="Edge (онлайн, лучше качество)" if CFG["engine"] == "edge" else "Голос Windows (офлайн)")
+        V.v_engine = tk.StringVar(value=label_of(ENGINES, CFG["engine"]))
         V.v_voice = tk.StringVar(value=CFG.get("voice", ""))
 
         def row(i, text, widget):
@@ -3070,8 +3301,7 @@ class App:
         cs = ttk.Combobox(f, textvariable=V.v_src, values=["Авто"] + names, state="readonly")
         cd = ttk.Combobox(f, textvariable=V.v_dst, values=names, state="readonly")
         cw = ttk.Combobox(f, textvariable=V.v_whisper, values=WHISPER_SIZES, state="readonly")
-        ce = ttk.Combobox(f, textvariable=V.v_engine, state="readonly",
-                          values=["Голос Windows (офлайн)", "Edge (онлайн, лучше качество)"])
+        ce = ttk.Combobox(f, textvariable=V.v_engine, state="readonly", values=[t for _, t in ENGINES])
         V.cv = ttk.Combobox(f, textvariable=V.v_voice, state="readonly")
         row(0, "Язык оригинала", cs)
         row(1, "Перевод на", cd)
@@ -3086,7 +3316,14 @@ class App:
 
         def fill_voices(_=None):
             lang = CFG["target"]
-            vals = LANGS[lang][3] if CFG["engine"] == "edge" else list_sapi_voices(lang)
+            if CFG["engine"] == "edge":
+                vals = LANGS[lang][3]
+            elif CFG["engine"] == "neural":
+                vals = [lab for lab, _ in neural_list(lang)]
+                if not vals:
+                    self.set_status("Для этого языка нет нейросетевого голоса — будет говорить голос Windows.")
+            else:
+                vals = list_sapi_voices(lang)
             V.cv.config(values=vals)
             if CFG.get("voice") not in vals:
                 CFG["voice"] = vals[0] if vals else ""
@@ -3096,6 +3333,7 @@ class App:
             CFG["target"] = codes[names.index(V.v_dst.get())]
             save_settings()
             fill_voices()
+            self.ensure_voice_async()
 
         def pick_whisper(_=None):
             CFG["whisper"] = V.v_whisper.get()
@@ -3105,13 +3343,15 @@ class App:
                 self.set_status("Для модели %s нужна загрузка — нажмите «Скачать модели»." % CFG["whisper"])
 
         def pick_engine(_=None):
-            CFG["engine"] = "edge" if V.v_engine.get().startswith("Edge") else "sapi"
+            CFG["engine"] = key_of(ENGINES, V.v_engine.get())
             save_settings()
             fill_voices()
+            self.ensure_voice_async()
 
         def pick_voice(_=None):
             CFG["voice"] = V.v_voice.get()
             save_settings()
+            self.ensure_voice_async()
         cs.bind("<<ComboboxSelected>>", pick_src)
         cd.bind("<<ComboboxSelected>>", pick_dst)
         cw.bind("<<ComboboxSelected>>", pick_whisper)
@@ -3172,6 +3412,30 @@ class App:
             restyle(parent)
         self.views.append(V)
         return V
+
+    def ensure_voice_async(self):
+        """Выбран нейроголос, а файлов нет: скачиваем его в фоне (прогресс на полосе загрузки)."""
+        if CFG["engine"] != "neural":
+            return
+        mid = neural_id(CFG["target"])
+        if not mid or neural_ready(mid):
+            return
+        if self.voice_thread is not None and self.voice_thread.is_alive():
+            return
+        self.voice_cancel.clear()
+
+        def run():
+            try:
+                download_neural(mid, lambda t, f: self.ui(self._on_progress, t, f), self.voice_cancel)
+                self.ui(self.set_status, "Голос скачан ✓ Нажмите «Проверить голос».")
+            except Cancelled:
+                self.ui(self.set_status, "Загрузка голоса отменена.")
+            except Exception as e:
+                self.ui(self.set_status, "Не удалось скачать голос: %s. Пока говорит голос Windows; повторите выбор голоса." % e)
+                log(traceback.format_exc())
+        self.voice_thread = threading.Thread(target=run, daemon=True)
+        self.voice_thread.start()
+        self.set_status("Скачиваю нейроголос (~60 МБ) — прогресс на полосе загрузки.")
 
     def vset(self, name, **kw):
         for v in list(self.views):
@@ -3237,6 +3501,9 @@ class App:
         def run():
             try:
                 HUB.download(CFG["whisper"], lambda t, f: self.ui(self._on_progress, t, f), self.dl_cancel)
+                mid = neural_id(CFG["target"]) if CFG["engine"] == "neural" else None
+                if mid:
+                    download_neural(mid, lambda t, f: self.ui(self._on_progress, t, f), self.dl_cancel)
                 self.ui(self.set_status, "Модели готовы ✓ Включите видео и нажмите F10.")
             except Cancelled:
                 self.ui(self.set_status, "Загрузка отменена. «Скачать модели» продолжит с того же места.")
@@ -3359,6 +3626,9 @@ class App:
         self.root.mainloop()
 
 def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--neural-worker":      # отдельный процесс озвучки нейроголосом
+        neural_worker_main(int(sys.argv[2]))
+        return
     k32 = ctypes.windll.kernel32
     mutex = k32.CreateMutexW(None, False, "Babelo_single_instance")
     if k32.GetLastError() == 183:
