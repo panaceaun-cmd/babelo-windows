@@ -908,6 +908,8 @@ def com_init():
         except Exception:
             pass
 
+SENT_END_RE = re.compile(r'[.!?…。！？]["\')»”]*\s*$')
+
 class Phrase:
     def __init__(self, audio, t, prep, start, end):
         self.audio, self.t, self.prep, self.start, self.end = audio, t, prep, start, end
@@ -1055,7 +1057,7 @@ class Engine:
                 if not buf:
                     continue
                 prep = self.phase == 1
-                max_sec = max(int(CFG["phrase_sec"]), 12) if prep else int(CFG["phrase_sec"])
+                max_sec = max(int(CFG["phrase_sec"]), 12) if (prep or CFG["mode"] == "interrupted") else int(CFG["phrase_sec"])
                 pause_frames = max(1, int(CFG["pause_ms"] // 100))
                 if silent < pause_frames and n_samples <= max_sec * 16000:
                     continue
@@ -1262,6 +1264,19 @@ class Engine:
             self.app.muter.restore()
         return True
 
+    def fragment_full(self, start, end, say, tts, mute_others):
+        """Отрывок с переводом; если пользователь поставил паузу — ждём «Пуск» и проходим отрывок заново целиком."""
+        while True:
+            ok = self.fragment(start, end, say, tts, mute_others)
+            if not self.hold.is_set():
+                return ok
+            tts.stop_now()
+            self.notice("Пауза. После «Пуск» отрывок с переводом прозвучит заново, целиком.", 30)
+            while self.hold.is_set() and not self.stop_evt.is_set():
+                time.sleep(0.1)
+            if self.stop_evt.is_set():
+                return False
+
     def process_interrupted(self, ph, tts):
         media = self.app.media
         target = CFG["target"]
@@ -1273,7 +1288,18 @@ class Engine:
             res = self.understand(ph.audio)
             if not res:
                 return
-            made = self.make_sub(*res)
+            text0, frm0 = res
+            carry = getattr(self, "carry", None)
+            if carry and time.time() - carry["t"] > 8:
+                carry = None
+            full = (carry["text"] + " " + text0) if carry else text0
+            if not SENT_END_RE.search(full.strip()) and len(full) < 220:   # предложение не закончено: ждём продолжение
+                self.carry = {"text": full, "start": carry["start"] if carry else ph.start, "t": time.time()}
+                return
+            if carry:
+                ph.start = carry["start"]                                    # отрывок для повтора — с начала предложения
+            self.carry = None
+            made = self.make_sub(full, frm0)
             if not made:
                 return
             sub, speak = made
@@ -1294,13 +1320,13 @@ class Engine:
                     break
                 if seek_ok and i > 0:                            # оригинал ещё раз
                     self.app.ui(self.app.subs.show_sub, sub, "orig")
-                    if not self.fragment(ph.start, ph.end, None, tts, False):
+                    if not self.fragment_full(ph.start, ph.end, None, tts, False):
                         seek_ok = False
                 self.wait(gap)                                   # пауза между фразой и переводом
                 self.app.ui(self.app.subs.show_sub, sub, "tr")
                 spoke = False
                 if seek_ok:                                      # тот же отрывок, но с голосом перевода
-                    spoke = self.fragment(ph.start, ph.end, (speak, mp3), tts, True)
+                    spoke = self.fragment_full(ph.start, ph.end, (speak, mp3), tts, True)
                     if not spoke:
                         seek_ok = False
                 if not spoke:                                    # перематывать нельзя: говорим на паузе
@@ -1917,9 +1943,28 @@ class Subtitles:
         self.show(text)
         self.job = self.root.after(ms, self.hide)
 
+class SettingsView:
+    """Виджеты одного экземпляра панели настроек (главное окно или меню по F10)."""
+    dead = False
+
+def restyle(w):
+    """Тёмная тема для ttk-виджетов внутри меню."""
+    for c in w.winfo_children():
+        try:
+            k = c.winfo_class()
+            if k == "TLabel":
+                c.configure(style="D.TLabel")
+            elif k == "TFrame":
+                c.configure(style="D.TFrame")
+            elif k == "TCheckbutton":
+                c.configure(style="D.TCheckbutton")
+        except Exception:
+            pass
+        restyle(c)
+
 class Menu:
     """Короткое меню, выезжающее справа. Заголовок и нижние кнопки всегда видны, середина прокручивается."""
-    W = 390
+    W = 560
 
     def __init__(self, app):
         self.app = app
@@ -1946,15 +1991,14 @@ class Menu:
                   activeforeground="white", command=self.hide).pack(side="right")
         foot = tk.Frame(w, bg=BG)
         foot.pack(side="bottom", fill="x", padx=14, pady=(4, 10))
-        for text, cmd in (("Все настройки", self.app.show_main), ("Полное закрытие программы", self.app.full_close)):
-            tk.Button(foot, text=text, command=cmd, bg="#333", fg="white", activebackground="#444",
-                      activeforeground="white", relief="flat", pady=5).pack(fill="x", pady=2)
+        tk.Button(foot, text="Полное закрытие программы", command=self.app.full_close, bg="#333", fg="white",
+                  activebackground="#444", activeforeground="white", relief="flat", pady=5).pack(fill="x", pady=2)
         outer, inner, canvas = make_scroll(w, bg=BG)
         outer.pack(side="top", fill="both", expand=True)
-        add_controls(inner, True, self.app)
+        self.view = self.app.build_settings(inner, True)             # те же настройки, что в главном окне
         w.update_idletasks()
         sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
-        h = min(inner.winfo_reqheight() + 120, sh - 80)
+        h = min(inner.winfo_reqheight() + 120, sh - 60)
         y = max(10, (sh - h) // 2)
         self.win = w
         self._anim(w, sw, sw - self.W, y, h, 0, None)
@@ -1975,6 +2019,14 @@ class Menu:
         if w is None:
             return
         self.win = None
+        v = getattr(self, "view", None)
+        if v is not None:
+            v.dead = True
+            try:
+                self.app.views.remove(v)
+            except ValueError:
+                pass
+            self.view = None
         try:
             sw = w.winfo_screenwidth()
             geo = w.geometry()
@@ -2294,23 +2346,67 @@ class ItemPlayer:
             time.sleep(0.05)
 
     def play_until(self, end_s, timeout):
+        """Проигрывает до end_s. Возвращает "ok", "paused" (пользователь поставил паузу) или "stop"."""
         t0 = time.time()
         while not self.stop_evt.is_set() and time.time() - t0 < timeout:
             p = self.be.pos()
             if p is not None and p >= end_s:
-                break
+                return "ok"
+            if time.time() - t0 > 0.8 and self.be.paused():
+                return "paused"
             time.sleep(0.03)
+        return "stop" if self.stop_evt.is_set() else "ok"
+
+    def wait_resume(self):
+        """Пользователь на паузе: ждём, пока он снова включит воспроизведение."""
+        while not self.stop_evt.is_set():
+            if not self.be.paused():
+                return True
+            time.sleep(0.1)
+        return False
 
     def seek_failed(self):
         log("перемотка видео не сработала")
         self.app.ui(self.app.banner.status, "Перемотка видео не сработала — повтор отрывка пропущен")
 
+    def replay(self, it, tts, speak):
+        """Один проход отрывка (с голосом перевода или с оригиналом). Если пользователь ставит паузу, стоим на паузе,
+        а после «Пуск» проходим отрывок заново ПОЛНОСТЬЮ — перевод не обрывается."""
+        be = self.be
+        st, en = it.start / 1000.0, it.end / 1000.0
+        target = CFG["target"]
+        while not self.stop_evt.is_set():
+            self.guard(4)
+            be.volume(0 if (speak and CFG["mute_original"]) else 100)
+            if not be.seek(st):
+                self.seek_failed()
+                return False
+            if speak:
+                try:
+                    tts.say_now(it.speak, target, it.pct, it.mp3)
+                except Exception as e:
+                    log("озвучка: %s" % e)
+            be.set_pause(False)
+            r = self.play_until(en, en - st + 4)
+            if r == "paused":
+                tts.stop_now()
+                self.app.ui(self.app.banner.status, "Пауза. После «Пуск» отрывок с переводом прозвучит заново, целиком.")
+                if not self.wait_resume():
+                    return False
+                continue
+            if r == "stop":
+                return False
+            be.set_pause(True)
+            if speak:
+                tts.wait_done(self.stop_evt, 40)                       # перевод договаривается до конца
+            be.volume(100)
+            return True
+        return False
+
     def run_interrupted(self, it, tts):
         be, app = self.be, self.app
-        target = CFG["target"]
         n = max(1, int(CFG["repeats"]))
         gap = float(CFG["pause_s"])
-        st, en = it.start / 1000.0, it.end / 1000.0
         self.guard(6)
         be.set_pause(True)
         for r in range(n):
@@ -2318,34 +2414,19 @@ class ItemPlayer:
                 break
             if r > 0:                                                   # оригинал ещё раз
                 app.ui(app.subs.show_sub, it.sub, "orig")
-                self.guard(4)
-                be.volume(100)
-                if not be.seek(st):
-                    self.seek_failed()
+                if not self.replay(it, tts, False):
                     break
-                be.set_pause(False)
-                self.play_until(en, en - st + 4)
-                be.set_pause(True)
             self.wait(gap)                                              # пауза между фразой и переводом
             app.ui(app.subs.show_sub, it.sub, "tr")
-            self.guard(4)
-            be.volume(0 if CFG["mute_original"] else 100)
-            if not be.seek(st):
-                self.seek_failed()
+            if not self.replay(it, tts, True):
                 break
-            try:
-                tts.say_now(it.speak, target, it.pct, it.mp3)
-            except Exception as e:
-                log("озвучка: %s" % e)
-            be.set_pause(False)
-            self.play_until(en, en - st + 4)
-            be.set_pause(True)
-            tts.wait_done(self.stop_evt, 40)
-            be.volume(100)
             self.wait(gap)
         app.ui(app.subs.hide)
+        app.ui(app.banner.status, None)
+        if self.stop_evt.is_set():
+            return
         self.guard(4)
-        be.seek(en)
+        be.seek(it.end / 1000.0)
         be.set_pause(False)
 
     def play_loop(self):
@@ -2354,7 +2435,7 @@ class ItemPlayer:
         be, app = self.be, self.app
         items, starts, ptr, last_ver = [], [], 0, -1
         last_pos, last_t, shown = None, time.time(), None
-        elastic_t, last_status, vol_set = 0.0, None, None
+        elastic_t, last_status, vol_set, pause_item = 0.0, None, None, None
         while not self.stop_evt.is_set():
             time.sleep(0.04)
             try:
@@ -2415,8 +2496,17 @@ class ItemPlayer:
                 if self.buffering:
                     continue
                 if paused and not self.elastic:                              # пользователь на паузе: перевод ждёт
+                    if shown is not None and pause_item is None:
+                        pause_item = shown                                    # эта фраза должна прозвучать целиком после «Пуск»
                     tts.stop_now()
                     continue
+                if pause_item is not None:
+                    it, pause_item = pause_item, None
+                    if pos * 1000 <= it.end + 1500:
+                        try:
+                            tts.say_now(it.speak, CFG["target"], int(min(220, it.pct * max(1.0, be.rate()))), it.mp3)
+                        except Exception as e:
+                            log("озвучка: %s" % e)
                 target = CFG["target"]
                 if mode == "interrupted":
                     if vol_set != 100:
@@ -2425,7 +2515,7 @@ class ItemPlayer:
                     if ptr < len(items) and pos * 1000 >= items[ptr].end:
                         it = items[ptr]
                         ptr += 1
-                        if pos * 1000 - it.end < 800:
+                        if pos * 1000 - it.end < 4000:                 # ни одну фразу не пропускаем
                             self.run_interrupted(it, tts)
                             last_pos = None
                     continue
@@ -2680,6 +2770,14 @@ class App:
         self.hk_tid = None
         self.filesess = None
         self.starting = False
+        self.views = []
+        try:
+            st = ttk.Style(self.root)
+            st.configure("D.TLabel", background=BG, foreground="white")
+            st.configure("D.TFrame", background=BG)
+            st.configure("D.TCheckbutton", background=BG, foreground="white")
+        except Exception:
+            pass
         try:
             install_extension_files()
         except Exception as e:
@@ -2773,10 +2871,11 @@ class App:
                             "Сейчас такой плеер не найден — включите видео.", 6000)
 
     def sync_ui(self):
-        try:
-            self.refresh_controls()
-        except Exception:
-            pass
+        for v in list(self.views):
+            try:
+                v.refresh_controls()
+            except Exception:
+                pass
 
     def start(self):
         if not HUB.ready(CFG["whisper"]):
@@ -2944,127 +3043,149 @@ class App:
         self.logbox.pack(side="bottom", fill="x", padx=10, pady=4)
         outer, inner, canvas = make_scroll(r)
         outer.pack(side="top", fill="both", expand=True)
+        self.main_view = self.build_settings(inner, False)
 
-        fb = ttk.Frame(inner)
+    def build_settings(self, parent, dark=False):
+        """ВСЕ настройки программы. Одно и то же строится в главном окне и в меню по F10 — меню единое."""
+        V = SettingsView()
+        fb = ttk.Frame(parent)
         fb.pack(fill="x", padx=10, pady=(8, 2))
         ttk.Button(fb, text="Открыть видео/аудио файл (проигрыватель с непрерывным переводом)", command=self.pick_file).pack(side="left", padx=2)
         ttk.Button(fb, text="Открыть ссылку…", command=self.pick_url).pack(side="left", padx=2)
         ttk.Button(fb, text="Установить расширение для браузера", command=self.install_extension).pack(side="left", padx=2)
-        f = ttk.Frame(inner)
+        f = ttk.Frame(parent)
         f.pack(fill="x", padx=10, pady=4)
         names = [LANGS[c][0] for c in LANGS]
         codes = list(LANGS)
-        self.v_src = tk.StringVar(value="Авто" if CFG["source"] == "auto" else LANGS.get(CFG["source"], ("Авто",))[0])
-        self.v_dst = tk.StringVar(value=LANGS[CFG["target"]][0])
-        self.v_whisper = tk.StringVar(value=CFG["whisper"])
-        self.v_engine = tk.StringVar(value="Edge (онлайн, лучше качество)" if CFG["engine"] == "edge" else "Голос Windows (офлайн)")
-        self.v_voice = tk.StringVar(value=CFG.get("voice", ""))
+        V.v_src = tk.StringVar(value="Авто" if CFG["source"] == "auto" else LANGS.get(CFG["source"], ("Авто",))[0])
+        V.v_dst = tk.StringVar(value=LANGS[CFG["target"]][0])
+        V.v_whisper = tk.StringVar(value=CFG["whisper"])
+        V.v_engine = tk.StringVar(value="Edge (онлайн, лучше качество)" if CFG["engine"] == "edge" else "Голос Windows (офлайн)")
+        V.v_voice = tk.StringVar(value=CFG.get("voice", ""))
 
         def row(i, text, widget):
             ttk.Label(f, text=text).grid(row=i, column=0, sticky="w", pady=3)
             widget.grid(row=i, column=1, sticky="ew", padx=8, pady=3)
         f.columnconfigure(1, weight=1)
-        cs = ttk.Combobox(f, textvariable=self.v_src, values=["Авто"] + names, state="readonly")
-        cd = ttk.Combobox(f, textvariable=self.v_dst, values=names, state="readonly")
-        cw = ttk.Combobox(f, textvariable=self.v_whisper, values=WHISPER_SIZES, state="readonly")
-        ce = ttk.Combobox(f, textvariable=self.v_engine, state="readonly",
+        cs = ttk.Combobox(f, textvariable=V.v_src, values=["Авто"] + names, state="readonly")
+        cd = ttk.Combobox(f, textvariable=V.v_dst, values=names, state="readonly")
+        cw = ttk.Combobox(f, textvariable=V.v_whisper, values=WHISPER_SIZES, state="readonly")
+        ce = ttk.Combobox(f, textvariable=V.v_engine, state="readonly",
                           values=["Голос Windows (офлайн)", "Edge (онлайн, лучше качество)"])
-        self.cv = ttk.Combobox(f, textvariable=self.v_voice, state="readonly")
+        V.cv = ttk.Combobox(f, textvariable=V.v_voice, state="readonly")
         row(0, "Язык оригинала", cs)
         row(1, "Перевод на", cd)
         row(2, "Распознавание (tiny быстро … large-v3 точно)", cw)
         row(3, "Озвучка", ce)
-        row(4, "Голос", self.cv)
+        row(4, "Голос", V.cv)
 
         def pick_src(_=None):
-            n = self.v_src.get()
+            n = V.v_src.get()
             CFG["source"] = "auto" if n == "Авто" else codes[names.index(n)]
             save_settings()
 
         def fill_voices(_=None):
             lang = CFG["target"]
             vals = LANGS[lang][3] if CFG["engine"] == "edge" else list_sapi_voices(lang)
-            self.cv.config(values=vals)
+            V.cv.config(values=vals)
             if CFG.get("voice") not in vals:
                 CFG["voice"] = vals[0] if vals else ""
-            self.v_voice.set(CFG["voice"])
+            V.v_voice.set(CFG["voice"])
 
         def pick_dst(_=None):
-            CFG["target"] = codes[names.index(self.v_dst.get())]
+            CFG["target"] = codes[names.index(V.v_dst.get())]
             save_settings()
             fill_voices()
 
         def pick_whisper(_=None):
-            CFG["whisper"] = self.v_whisper.get()
+            CFG["whisper"] = V.v_whisper.get()
             save_settings()
             self.refresh_models_state()
             if not HUB.ready(CFG["whisper"]):
                 self.set_status("Для модели %s нужна загрузка — нажмите «Скачать модели»." % CFG["whisper"])
 
         def pick_engine(_=None):
-            CFG["engine"] = "edge" if self.v_engine.get().startswith("Edge") else "sapi"
+            CFG["engine"] = "edge" if V.v_engine.get().startswith("Edge") else "sapi"
             save_settings()
             fill_voices()
 
         def pick_voice(_=None):
-            CFG["voice"] = self.v_voice.get()
+            CFG["voice"] = V.v_voice.get()
             save_settings()
         cs.bind("<<ComboboxSelected>>", pick_src)
         cd.bind("<<ComboboxSelected>>", pick_dst)
         cw.bind("<<ComboboxSelected>>", pick_whisper)
         ce.bind("<<ComboboxSelected>>", pick_engine)
-        self.cv.bind("<<ComboboxSelected>>", pick_voice)
+        V.cv.bind("<<ComboboxSelected>>", pick_voice)
         fill_voices()
 
         # те же настройки, что в коротком меню: режимы, субтитры, паузы, повторы, громкость
-        self.refresh_controls = add_controls(inner, False, self)
-        self.v_esc = tk.BooleanVar(value=bool(CFG.get("esc_stops", True)))
+        V.refresh_controls = add_controls(parent, False, self)
+        V.v_esc = tk.BooleanVar(value=bool(CFG.get("esc_stops", True)))
 
         def chg2():
-            CFG["esc_stops"] = bool(self.v_esc.get())
+            CFG["esc_stops"] = bool(V.v_esc.get())
             save_settings()
-        ttk.Checkbutton(inner, text="Esc выключает перевод (пока перевод включён, Esc не работает в других программах)",
-                        variable=self.v_esc, command=chg2).pack(anchor="w", padx=12, pady=(8, 0))
+        ttk.Checkbutton(parent, text="Esc выключает перевод (пока перевод включён, Esc не работает в других программах)",
+                        variable=V.v_esc, command=chg2).pack(anchor="w", padx=12, pady=(8, 0))
 
         # потоки распознавания — только здесь
-        lab = ttk.Label(inner, text="")
+        lab = ttk.Label(parent, text="")
         lab.pack(anchor="w", padx=12, pady=(8, 0))
 
         def upd(v):
             CFG["threads"] = int(float(v))
             lab.config(text="Потоки распознавания (больше — быстрее, но тяжелее): %d" % CFG["threads"])
-        sc = ttk.Scale(inner, from_=2, to=12, orient="horizontal", command=upd)
+        sc = ttk.Scale(parent, from_=2, to=12, orient="horizontal", command=upd)
         sc.set(int(CFG["threads"]))
         sc.bind("<ButtonRelease-1>", lambda e: save_settings())
         sc.pack(fill="x", padx=12)
         upd(CFG["threads"])
 
-        self.models_lbl = ttk.Label(inner, text="", font=("Segoe UI", 9, "bold"))
-        self.models_lbl.pack(anchor="w", padx=12, pady=(10, 0))
-        self.dl_label = ttk.Label(inner, text="Загрузка не идёт.", wraplength=640)
-        self.dl_label.pack(anchor="w", padx=12)
-        self.dl_bar = ttk.Progressbar(inner, maximum=100)
-        self.dl_bar.pack(fill="x", padx=12, pady=2)
-        self.stats_lbl = ttk.Label(inner, text="Перевод выключен.", wraplength=640)
-        self.stats_lbl.pack(anchor="w", padx=12, pady=2)
-        tkf = ttk.Frame(inner)
+        V.models_lbl = ttk.Label(parent, text="", font=("Segoe UI", 9, "bold"))
+        V.models_lbl.pack(anchor="w", padx=12, pady=(10, 0))
+        V.dl_label = ttk.Label(parent, text="Загрузка не идёт.", wraplength=640)
+        V.dl_label.pack(anchor="w", padx=12)
+        V.dl_bar = ttk.Progressbar(parent, maximum=100)
+        V.dl_bar.pack(fill="x", padx=12, pady=2)
+        V.stats_lbl = ttk.Label(parent, text="Перевод выключен.", wraplength=640)
+        V.stats_lbl.pack(anchor="w", padx=12, pady=2)
+        tkf = ttk.Frame(parent)
         tkf.pack(fill="x", padx=12, pady=2)
         ttk.Label(tkf, text="Токен GitHub (нужен только для закрытого репозитория):").pack(side="left")
-        self.v_token = tk.StringVar(value=str(CFG.get("github_token", "")))
-        te = ttk.Entry(tkf, textvariable=self.v_token, show="•", width=22)
+        V.v_token = tk.StringVar(value=str(CFG.get("github_token", "")))
+        te = ttk.Entry(tkf, textvariable=V.v_token, show="•", width=22)
         te.pack(side="left", padx=6)
 
         def save_token(_=None):
-            CFG["github_token"] = self.v_token.get().strip()
+            CFG["github_token"] = V.v_token.get().strip()
             save_settings()
         te.bind("<FocusOut>", save_token)
-        bar = ttk.Frame(inner)
+        bar = ttk.Frame(parent)
         bar.pack(fill="x", padx=8, pady=8)
         ttk.Button(bar, text="Скачать модели", command=self.download).pack(side="left", padx=4)
         ttk.Button(bar, text="Отмена загрузки", command=lambda: self.dl_cancel.set()).pack(side="left", padx=4)
-        self.btn_update = ttk.Button(bar, text="Проверить обновления", command=self.on_update_btn)
-        self.btn_update.pack(side="left", padx=4)
+        V.btn_update = ttk.Button(bar, text="Проверить обновления", command=self.on_update_btn)
+        V.btn_update.pack(side="left", padx=4)
         ttk.Button(bar, text="Проверить голос", command=self.test_voice).pack(side="left", padx=4)
+        if dark:
+            restyle(parent)
+        self.views.append(V)
+        return V
+
+    def vset(self, name, **kw):
+        for v in list(self.views):
+            try:
+                getattr(v, name).config(**kw)
+            except Exception:
+                pass
+
+    def vbar(self, value):
+        for v in list(self.views):
+            try:
+                v.dl_bar["value"] = value
+            except Exception:
+                pass
 
     def pick_file(self):
         p = filedialog.askopenfilename(title="Видео или аудио", filetypes=[
@@ -3098,20 +3219,20 @@ class App:
     def refresh_models_state(self):
         w = os.path.exists(os.path.join(HUB.whisper_dir(CFG["whisper"]), "model.bin"))
         n = os.path.exists(os.path.join(NLLB_DIR, "model.bin"))
-        self.models_lbl.config(text="Модели:  распознавание (%s) — %s     перевод (NLLB) — %s" % (
+        self.vset("models_lbl", text="Модели:  распознавание (%s) — %s     перевод (NLLB) — %s" % (
             CFG["whisper"], "✓ скачано" if w else "✗ нет", "✓ скачано" if n else "✗ нет"))
 
     def _on_progress(self, text, frac):
-        self.dl_label.config(text=text)
+        self.vset("dl_label", text=text)
         if frac is not None:
-            self.dl_bar["value"] = frac * 100
+            self.vbar(frac * 100)
 
     def download(self):
         if self.dl_thread is not None and self.dl_thread.is_alive():
             self.set_status("Загрузка уже идёт — следите за полосой ниже.")
             return
         self.dl_cancel.clear()
-        self.dl_bar["value"] = 0
+        self.vbar(0)
 
         def run():
             try:
@@ -3151,7 +3272,7 @@ class App:
 
     def offer_update(self, build, asset, silent):
         self.pending_update = (build, asset)
-        self.btn_update.config(text="Установить обновление (сборка %d)" % build)
+        self.vset("btn_update", text="Установить обновление (сборка %d)" % build)
         self.set_status("Вышла новая версия (сборка %d, у вас %d). Нажмите «Установить обновление»." % (build, APP_BUILD))
         if silent and self.root.state() != "withdrawn" and self.engine is None:
             if messagebox.askyesno("Babelo", "Вышла новая версия (сборка %d). Установить сейчас?\n"
@@ -3174,7 +3295,7 @@ class App:
         build, asset = self.pending_update
         zip_path = os.path.join(tempfile.gettempdir(), "Babelo-update-%d.zip" % build)
         self.dl_cancel.clear()
-        self.dl_bar["value"] = 0
+        self.vbar(0)
 
         def run():
             try:
@@ -3220,7 +3341,7 @@ class App:
                 player = "плеер не найден"
             txt = "Перевод включён · слышу: %s · %s · фраз услышано %d, распознано %d, переведено %d, озвучено %d, ошибок %d" % (
                 sound, player, s["heard"], s["recognised"], s["translated"], s["spoken"], s["errors"])
-        self.stats_lbl.config(text=txt)
+        self.vset("stats_lbl", text=txt)
         self.root.after(1000, self._tick)
 
     def test_voice(self):
