@@ -593,10 +593,14 @@ def neural_worker_main(port):
     sock = socket.create_connection(("127.0.0.1", port))
     f = sock.makefile("rwb")
     cache, best = {}, {}
+    ver = str(getattr(sherpa_onnx, "__version__", "0"))
+    too_new = ver.split(".")[0].isdigit() and int(ver.split(".")[0]) >= 2      # в версии 2.x убран модуль фонем: Piper молчит
     for line in f:
         try:
             req = json.loads(line.decode("utf-8"))
             d, mid = req["dir"], req["id"]
+            if too_new:
+                raise RuntimeError("установлена библиотека озвучки sherpa-onnx %s: в версии 2.x убраны фонемы, нужен 1.x (пересоберите программу)" % ver)
             audio, notes = None, []
             for v in [best.get(d, 0)] + [x for x in range(4) if x != best.get(d, 0)]:
                 try:

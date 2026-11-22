@@ -10,6 +10,7 @@ comtypes
 psutil
 pywin32
 edge-tts
-sherpa-onnx
+sherpa-onnx>=1.12,<2
+sherpa-onnx-core>=1.12,<2
 winsdk
 pyinstaller
