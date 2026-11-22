@@ -268,31 +268,82 @@ def download_asset(asset, dest, progress, cancel):
             log("обрыв при загрузке обновления: %s — пробую ещё раз" % e)
             time.sleep(3)
 
+UPDATER_PS1 = r"""
+param([int]$AppPid, [string]$Zip, [string]$App, [string]$Data)
+$ErrorActionPreference = "Stop"
+$log = Join-Path $Data "update.log"
+function L($m) {
+    $t = (Get-Date).ToString("HH:mm:ss") + " " + $m
+    Write-Host $t
+    try { Add-Content -LiteralPath $log -Value $t -Encoding UTF8 } catch {}
+}
+function KillBabelo {
+    Get-Process -Name Babelo -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID } | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+} catch {}
+$host.UI.RawUI.WindowTitle = "Обновление Babelo — не закрывайте это окно"
+Write-Host ""
+Write-Host "  Обновляю Babelo. Это займёт 1-2 минуты, окно закроется само." -ForegroundColor Cyan
+Write-Host ""
+try {
+    L "Жду, пока программа закроется..."
+    try { Wait-Process -Id $AppPid -Timeout 25 } catch {}
+    KillBabelo
+    Start-Sleep -Seconds 2
+    $tmp = Join-Path $env:TEMP "babelo_update_dir"
+    if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    L "Распаковываю новую версию..."
+    & tar -xf $Zip -C $tmp
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $tmp "Babelo\Babelo.exe"))) {
+        L "tar не справился, распаковываю другим способом (дольше)..."
+        Expand-Archive -LiteralPath $Zip -DestinationPath $tmp -Force
+    }
+    $src = Join-Path $tmp "Babelo"
+    if (-not (Test-Path (Join-Path $src "Babelo.exe"))) { throw "в скачанном архиве нет Babelo.exe" }
+    L "Заменяю файлы программы (настройки и модели не трогаю)..."
+    $ok = $false
+    for ($i = 1; $i -le 6; $i++) {
+        & robocopy $src $App /E /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+        if ($LASTEXITCODE -lt 8) { $ok = $true; break }
+        L ("попытка " + $i + ": файлы заняты (код " + $LASTEXITCODE + "), повторяю...")
+        KillBabelo
+        Start-Sleep -Seconds 3
+    }
+    if (-not $ok) { throw "не удалось заменить файлы: они заняты другой программой (закройте Babelo в диспетчере задач и повторите обновление)" }
+    $n = (Get-Item (Join-Path $src "Babelo.exe")).Length
+    $o = (Get-Item (Join-Path $App "Babelo.exe")).Length
+    if ($n -ne $o) { throw "Babelo.exe не заменился (размер не совпал)" }
+    L "Готово. Запускаю обновлённую программу..."
+    Start-Process -FilePath (Join-Path $App "Babelo.exe") -WorkingDirectory $App
+    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    Remove-Item -Force $Zip -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    exit 0
+} catch {
+    L ("ОШИБКА ОБНОВЛЕНИЯ: " + $_)
+    Write-Host ""
+    Write-Host "  Обновление не удалось. Подробности: $log" -ForegroundColor Red
+    Write-Host "  Запускаю прежнюю версию. Нажмите Enter, чтобы закрыть это окно."
+    try { Start-Process -FilePath (Join-Path $App "Babelo.exe") -WorkingDirectory $App } catch {}
+    try { [void][Console]::ReadLine() } catch { Start-Sleep -Seconds 30 }
+    exit 1
+}
+"""
+
 def launch_updater(zip_path):
-    """Скрипт ждёт закрытия программы, распаковывает новую версию ПОВЕРХ старой и запускает её. Модели и настройки не трогает."""
+    """Отдельное видимое окно PowerShell: ждёт выхода программы, убивает зависшие процессы Babelo, распаковывает новую версию
+    ПОВЕРХ старой, проверяет замену и запускает её. Модели и настройки не трогает. Журнал: %LOCALAPPDATA%\\Babelo\\update.log"""
     app_dir = os.path.dirname(os.path.abspath(sys.executable))
-    tmp = os.path.join(tempfile.gettempdir(), "babelo_update_dir")
-    q = lambda p: p.replace("'", "''")
-    script = (
-        "$zip = '%s'; $app = '%s'; $tmp = '%s'; $logf = '%s'\r\n"
-        "Start-Sleep -Seconds 3\r\n"
-        "try {\r\n"
-        "  if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }\r\n"
-        "  New-Item -ItemType Directory -Force -Path $tmp | Out-Null\r\n"
-        "  tar -xf $zip -C $tmp\r\n"
-        "  if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $tmp 'Babelo'))) { Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force }\r\n"
-        "  robocopy \"$tmp\\Babelo\" \"$app\" /E /R:10 /W:2 /NFL /NDL /NJH /NJS | Out-Null\r\n"
-        "  if ($LASTEXITCODE -ge 8) { \"robocopy: ошибка $LASTEXITCODE\" | Out-File -Append $logf }\r\n"
-        "} catch { $_ | Out-File -Append $logf }\r\n"
-        "Start-Process -FilePath (Join-Path $app 'Babelo.exe')\r\n"
-        "Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue\r\n"
-        "Remove-Item -Force $zip -ErrorAction SilentlyContinue\r\n"
-    ) % (q(zip_path), q(app_dir), q(tmp), q(os.path.join(DATA, "update.log")))
-    ps1 = os.path.join(tempfile.gettempdir(), "babelo_update.ps1")
+    os.makedirs(DATA, exist_ok=True)
+    ps1 = os.path.join(DATA, "update.ps1")
     with open(ps1, "w", encoding="utf-8-sig") as f:
-        f.write(script)
-    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", ps1],
-                     creationflags=0x08000000 | 0x00000008, close_fds=True)
+        f.write(UPDATER_PS1)
+    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "-AppPid", str(os.getpid()),
+                      "-Zip", zip_path, "-App", app_dir, "-Data", DATA],
+                     creationflags=0x00000010, close_fds=True)                  # CREATE_NEW_CONSOLE: окно видно
 
 class ModelHub:
     def __init__(self):
@@ -3654,10 +3705,14 @@ class App:
         except Exception as e:
             self.set_status("Не удалось запустить установку обновления: %s" % e)
             return
-        self.set_status("Устанавливаю обновление… программа закроется и откроется заново сама.")
+        self.set_status("Устанавливаю обновление… Babelo закроется, откроется чёрное окно установки (не закрывайте его) — потом программа запустится сама.")
         self.muter.restore()
         self.master.set(False)
-        self.root.after(600, lambda: os._exit(0))
+        try:
+            NEURAL.close()
+        except Exception:
+            pass
+        self.root.after(1200, lambda: os._exit(0))
 
     def _tick(self):
         e = self.engine
