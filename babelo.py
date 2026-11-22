@@ -562,28 +562,72 @@ def download_neural(mid, progress, cancel):
         raise RuntimeError("в архиве голоса нет нужных файлов")
     progress("%s: готово ✓" % title, 1.0)
 
+def _short_path(p):
+    """Короткий ASCII-путь Windows (8.3); если не получилось — как есть."""
+    try:
+        buf = ctypes.create_unicode_buffer(520)
+        n = ctypes.windll.kernel32.GetShortPathNameW(p, buf, 520)
+        return buf.value if n else p
+    except Exception:
+        return p
+
+def _neural_variant(d, mid, v):
+    """Четыре способа передать голосу пути: библиотека фонем на Windows капризна к ним."""
+    model, tokens, data = os.path.join(d, mid + ".onnx"), os.path.join(d, "tokens.txt"), os.path.join(d, "espeak-ng-data")
+    if v == 1:
+        return tuple(x.replace("\\", "/") for x in (model, tokens, data))
+    if v == 2:
+        return _short_path(model), _short_path(tokens), _short_path(data)
+    if v == 3:
+        os.chdir(d)                                              # относительные пути, как в примерах sherpa-onnx
+        return mid + ".onnx", "tokens.txt", "espeak-ng-data"
+    return model, tokens, data
+
+def neural_worker_log_path():
+    return os.path.join(DATA, "neural_worker.log")
+
 def neural_worker_main(port):
     """Отдельный процесс озвучки: sherpa-onnx живёт здесь, чтобы не конфликтовать с остальными моделями программы."""
     import socket, wave
     import sherpa_onnx
     sock = socket.create_connection(("127.0.0.1", port))
     f = sock.makefile("rwb")
-    cache = {}
+    cache, best = {}, {}
     for line in f:
         try:
             req = json.loads(line.decode("utf-8"))
             d, mid = req["dir"], req["id"]
-            if d not in cache:
-                cfg = sherpa_onnx.OfflineTtsConfig(model=sherpa_onnx.OfflineTtsModelConfig(
-                    vits=sherpa_onnx.OfflineTtsVitsModelConfig(model=os.path.join(d, mid + ".onnx"), lexicon="",
-                                                               data_dir=os.path.join(d, "espeak-ng-data"),
-                                                               tokens=os.path.join(d, "tokens.txt")),
-                    num_threads=int(req.get("threads", 2)), debug=False, provider="cpu"))
-                cache[d] = sherpa_onnx.OfflineTts(cfg)
-            audio = cache[d].generate(req["text"], sid=int(req.get("sid", 0)), speed=float(req.get("speed", 1.0)))
-            if len(audio.samples) == 0 or int(audio.sample_rate) <= 0:
-                raise RuntimeError("голос не вернул звук (папка голоса: %s, файлы на месте: %s)" % (
-                    d, all(os.path.exists(os.path.join(d, n)) for n in (mid + ".onnx", "tokens.txt", "espeak-ng-data"))))
+            audio, notes = None, []
+            for v in [best.get(d, 0)] + [x for x in range(4) if x != best.get(d, 0)]:
+                try:
+                    if (d, v) not in cache:
+                        model, tokens, data = _neural_variant(d, mid, v)
+                        cfg = sherpa_onnx.OfflineTtsConfig(model=sherpa_onnx.OfflineTtsModelConfig(
+                            vits=sherpa_onnx.OfflineTtsVitsModelConfig(model=model, lexicon="", data_dir=data, tokens=tokens),
+                            num_threads=int(req.get("threads", 2)), debug=False, provider="cpu"))
+                        cache[(d, v)] = sherpa_onnx.OfflineTts(cfg)
+                    a = cache[(d, v)].generate(req["text"], sid=int(req.get("sid", 0)), speed=float(req.get("speed", 1.0)))
+                    if len(a.samples) > 0 and int(a.sample_rate) > 0:
+                        audio, best[d] = a, v
+                        break
+                    notes.append("способ %d: пустой звук" % v)
+                except Exception as e:
+                    notes.append("способ %d: %s" % (v, str(e)[:100]))
+            if audio is None:
+                names = ("phontab", "phondata", "phonindex", "intonations", "ru_dict")
+                dd = os.path.join(d, "espeak-ng-data")
+                have = {n: os.path.exists(os.path.join(dd, n)) for n in names}
+                tail = ""
+                try:
+                    with open(neural_worker_log_path(), "rb") as lf:
+                        lf.seek(0, 2)
+                        lf.seek(max(0, lf.tell() - 700))
+                        tail = lf.read().decode("utf-8", "replace")
+                except Exception:
+                    pass
+                raise RuntimeError("голос не вернул звук. sherpa-onnx %s; %s; файлы данных: %s; в папке данных %d элементов; "
+                                   "вывод библиотеки: %s" % (getattr(sherpa_onnx, "__version__", "?"), "; ".join(notes), have,
+                                                             len(os.listdir(dd)) if os.path.isdir(dd) else -1, tail.strip()[-500:]))
             x = np.clip(np.asarray(audio.samples, dtype=np.float32) * float(req.get("gain", 1.0)), -1.0, 1.0)
             with wave.open(req["out"], "wb") as w:
                 w.setnchannels(1)
@@ -592,7 +636,7 @@ def neural_worker_main(port):
                 w.writeframes((x * 32767).astype("<i2").tobytes())
             reply = {"ok": True}
         except Exception as e:
-            reply = {"ok": False, "error": str(e)[:300]}
+            reply = {"ok": False, "error": str(e)[:1500]}
         f.write((json.dumps(reply) + "\n").encode("utf-8"))
         f.flush()
 
@@ -3650,6 +3694,12 @@ class App:
 
 def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "--neural-worker":      # отдельный процесс озвучки нейроголосом
+        try:
+            lf = open(neural_worker_log_path(), "a", buffering=1)
+            os.dup2(lf.fileno(), 1)
+            os.dup2(lf.fileno(), 2)
+        except Exception:
+            pass
         neural_worker_main(int(sys.argv[2]))
         return
     k32 = ctypes.windll.kernel32
