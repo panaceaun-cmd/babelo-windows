@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Babelo для Windows — живой перевод любого звука, который играет на компьютере.
-F10: первое нажатие — перевод включён; ещё раз — выезжает меню; два раза подряд — перевод выключен.
+F10: первое нажатие — перевод включён; ещё раз — выезжает меню; два раза подряд — полный перезапуск программы (Esc выключает перевод).
 Распознавание (Whisper) -> перевод (NLLB) -> озвучка (голос Windows или Edge), оригинал заглушается, субтитры белым по чёрному.
 """
 import os, sys, json, time, threading, queue, ctypes, traceback, re, tempfile, math, gc, subprocess, asyncio, datetime, bisect
@@ -1075,37 +1075,97 @@ class MasterMute:
 
 class Bridge:
     """Состояние видео и команды (пауза, пуск, перемотка) через расширение Babelo в браузере.
-    Это точнее и надёжнее, чем плеер Windows: перемотка идёт изнутри самой страницы."""
+    Каждая вкладка присылает своё состояние отдельно; программа «прикрепляется» к той вкладке и тому видео, которое переводит,
+    команды уходят только туда, а появление другого играющего видео (новая вкладка, следующее видео) замечается."""
     def __init__(self):
         self.lock = threading.Lock()
-        self.state = None
-        self.t = 0.0
+        self.tabs = {}              # id вкладки -> {"state": ..., "t": время}
         self.cmds = []
+        self.done = set()
         self.next_id = 1
-        self.acked = 0
         self.results = {}
+        self.pinned = None
+        self.pinned_vkey = None
         self.session = int(time.time() * 1000) % 1000000007
 
     def update(self, st):
+        tid = str(st.get("tab") or "legacy")
+        ack = int(st.get("ack") or 0)
         with self.lock:
-            self.state = st
-            self.t = time.time()
-            self.acked = max(self.acked, int(st.get("ack") or 0))
-            self.cmds = [c for c in self.cmds if c["id"] > self.acked]
-            return self.cmds[0] if self.cmds else None
+            now = time.time()
+            self.tabs[tid] = {"state": st, "t": now}
+            for k in [k for k, v in self.tabs.items() if now - v["t"] > 120]:
+                del self.tabs[k]
+            for c in self.cmds:
+                if c["tab"] in (None, tid) and c["id"] <= ack:
+                    self.done.add(c["id"])
+            self.cmds = [c for c in self.cmds if c["id"] not in self.done]
+            if len(self.done) > 1000:
+                self.done = set(sorted(self.done)[-300:])
+            for c in self.cmds:
+                if c["tab"] in (None, tid) and c["id"] > ack:
+                    return c
+            return None
+
+    def _best(self, now):
+        fresh = [(k, v) for k, v in self.tabs.items() if now - v["t"] < 1.5]
+        if not fresh:
+            return None
+        playing = [x for x in fresh if x[1]["state"].get("playing")]
+        return max(playing or fresh, key=lambda x: x[1]["t"])[0]
+
+    def active(self):
+        with self.lock:
+            now = time.time()
+            k = self.pinned if self.pinned is not None else self._best(now)
+            v = self.tabs.get(k) if k is not None else None
+            if v is None or now - v["t"] >= 1.5:
+                return None
+            return v["state"], v["t"], k
 
     def fresh(self):
-        return self.state is not None and time.time() - self.t < 1.5
+        return self.active() is not None
 
     def snapshot(self):
+        a = self.active()
+        return (dict(a[0]), a[1]) if a else ({}, 0.0)
+
+    def pin_best(self):
+        """Прикрепляемся к вкладке с играющим видео (или самой свежей): её и переводим."""
         with self.lock:
-            return dict(self.state or {}), self.t
+            k = self._best(time.time())
+            self.pinned = k
+            self.pinned_vkey = self.tabs[k]["state"].get("vkey") if k is not None else None
+            return k
+
+    def unpin(self):
+        with self.lock:
+            self.pinned = None
+            self.pinned_vkey = None
+            self.cmds = []
+
+    def switch_candidate(self):
+        """("video", вкладка) — в той же вкладке открыто другое видео; ("tab", вкладка) — заиграло видео в другой вкладке."""
+        with self.lock:
+            if self.pinned is None:
+                return None
+            now = time.time()
+            p = self.tabs.get(self.pinned)
+            pinned_fresh = p is not None and now - p["t"] < 1.5
+            if pinned_fresh and p["state"].get("vkey") != self.pinned_vkey:
+                return ("video", self.pinned)
+            if pinned_fresh and p["state"].get("playing"):
+                return None
+            for k, v in self.tabs.items():
+                if k != self.pinned and now - v["t"] < 1.5 and v["state"].get("playing"):
+                    return ("tab", k)
+            return None
 
     def send(self, typ, t=None, extra=None):
         with self.lock:
             cid = self.next_id
             self.next_id += 1
-            cmd = {"id": cid, "type": typ, "t": t}
+            cmd = {"id": cid, "type": typ, "t": t, "tab": self.pinned if self.pinned is not None else self._best(time.time())}
             if extra:
                 cmd.update(extra)
             self.cmds.append(cmd)
@@ -1130,7 +1190,7 @@ class Bridge:
         t0 = time.time()
         while time.time() - t0 < timeout:
             with self.lock:
-                if self.acked >= cid:
+                if cid in self.done:
                     return True
             time.sleep(0.03)
         return False
@@ -2069,7 +2129,7 @@ def exstyle(win, clickthrough):
     except Exception:
         pass
 
-HINT = "Перевод видео и аудио включён F10. Меню F10. Выключить — Esc или дважды F10"
+HINT = "Перевод включён · F10 — меню · Esc — выключить · дважды F10 — перезапуск программы"
 
 class Banner:
     """Подсказка самого вверху экрана (всё время, пока идёт перевод) и под ней строка состояния."""
@@ -2466,7 +2526,7 @@ class LocalServer:
                         self._send(200, outer.translate(body))
                     elif self.path == "/media/state":
                         cmd = BRIDGE.update(body)
-                        self._send(200, {"cmd": cmd, "session": BRIDGE.session, "ext": ext_version()})
+                        self._send(200, {"cmd": cmd, "session": BRIDGE.session, "ext": ext_version(), "pinned": BRIDGE.pinned})
                     elif self.path == "/media/result":
                         BRIDGE.put_result(int(body.get("id", 0)), body.get("data"))
                         self._send(200, {})
@@ -3122,6 +3182,7 @@ class App:
         self.views = []
         self.voice_thread = None
         self.voice_cancel = threading.Event()
+        self._switch_seen = None
         try:
             st = ttk.Style(self.root)
             st.configure("D.TLabel", background=BG, foreground="white")
@@ -3146,6 +3207,7 @@ class App:
         self.root.after(1000, self._tick)
         self.root.after(4000, lambda: self.check_updates(True))      # тихая проверка обновлений при запуске
         self.root.after(9000, self._maybe_prompt_ext)
+        self.root.after(1500, self._bridge_watch)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_main)
         threading.Thread(target=self._hotkey, daemon=True).start()
         self.root.after(50, self._poll)
@@ -3208,13 +3270,58 @@ class App:
         now = time.time()
         quick = now - self.last_f10 < 0.45
         self.last_f10 = now
-        if self.engine is None and self.filesess is None:
+        if quick:                                                 # двойное F10: полный перезапуск программы
+            self.restart_program()
+        elif self.engine is None and self.filesess is None and not self.starting:
             self.start()
-        elif quick:
-            self.menu.hide()
-            self.stop()
         else:
             self.menu.toggle()
+
+    def restart_program(self):
+        """Принудительно закрывает программу целиком (перевод, голос, звук, фоновые процессы) и запускает её заново."""
+        log("двойное F10: полный перезапуск программы")
+        try:
+            self.stop()
+            self.muter.restore()
+            self.master.set(False)
+            self.subs.hide()
+            NEURAL.close()
+        except Exception as e:
+            log("перезапуск: %s" % e)
+        try:
+            q = lambda x: x.replace("'", "''")
+            if getattr(sys, "frozen", False):
+                cmd = "Start-Process -FilePath '%s' -WorkingDirectory '%s'" % (q(sys.executable), q(os.path.dirname(sys.executable)))
+            else:
+                cmd = "Start-Process -FilePath '%s' -ArgumentList '\"%s\"'" % (q(sys.executable), q(os.path.abspath(__file__)))
+            subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
+                              "Start-Sleep -Milliseconds 2500; " + cmd], creationflags=0x08000000, close_fds=True)
+        except Exception as e:
+            log("не удалось запустить заново: %s" % e)
+        self.root.after(300, lambda: os._exit(0))
+
+    def restart_session(self, why):
+        """Открыто другое видео или другая вкладка: перевод полностью перезапускается для нового видео."""
+        log("перезапуск перевода: %s" % why)
+        self.stop()
+        self.set_status("%s — перевод запускается заново…" % why)
+        self.root.after(900, self.start)
+
+    def _bridge_watch(self):
+        try:
+            active = (self.engine is not None or isinstance(self.filesess, CaptionSession)) and not self.starting
+            cand = BRIDGE.switch_candidate() if active else None
+            now = time.time()
+            if cand is None:
+                self._switch_seen = None
+            elif self._switch_seen is None or self._switch_seen[0] != cand:
+                self._switch_seen = (cand, now)
+            elif now - self._switch_seen[1] >= 1.2:               # устойчиво, не мигание
+                self._switch_seen = None
+                self.restart_session("Открыто другое видео" if cand[0] == "tab" else "Переключено видео в этой вкладке")
+        except Exception as e:
+            log("наблюдение за вкладками: %s" % e)
+        self.root.after(500, self._bridge_watch)
 
     def on_mode_changed(self):
         if CFG["mode"] != "live" and not self.media.available():
@@ -3230,6 +3337,7 @@ class App:
 
     def start(self):
         self.ensure_voice_async()
+        BRIDGE.pin_best()                                         # переводим то видео, которое играет сейчас
         if not HUB.ready(CFG["whisper"]):
             self.show_main()
             self.set_status("Сначала скачайте модели (кнопка «Скачать модели»), потом нажмите F10.")
@@ -3283,7 +3391,7 @@ class App:
     def start_engine(self):
         self.engine = Engine(self)
         self.engine.start()
-        self.set_status("Перевод включён. F10 — меню, F10 два раза подряд — выключить.")
+        self.set_status("Перевод включён. F10 — меню, Esc — выключить, F10 два раза подряд — перезапуск программы.")
         self.banner.on(HINT)                                      # видна всё время, пока идёт перевод
         if CFG.get("esc_stops"):
             self.esc_hotkey(True)
@@ -3324,6 +3432,7 @@ class App:
 
     def stop(self):
         self.starting = False
+        BRIDGE.unpin()
         had_engine = self.engine is not None
         if self.engine is not None:
             self.engine.stop()
@@ -3391,7 +3500,7 @@ class App:
                                wraplength=520, font=("Segoe UI", 10, "bold"))
         self.status.pack(side="left", fill="x", expand=True)
         ttk.Button(top, text="Полное закрытие программы", command=self.full_close).pack(side="right", padx=4)
-        ttk.Label(r, text="F10: включить · ещё раз: меню · два раза подряд: выключить").pack(side="bottom", pady=3)
+        ttk.Label(r, text="F10: включить · ещё раз: меню · Esc: выключить · два раза подряд: перезапуск программы").pack(side="bottom", pady=3)
         self.logbox = tk.Text(r, height=7, state="disabled", bg="#111", fg="#ddd", font=("Consolas", 9))
         self.logbox.pack(side="bottom", fill="x", padx=10, pady=4)
         outer, inner, canvas = make_scroll(r)
@@ -3406,6 +3515,10 @@ class App:
         ttk.Button(fb, text="Открыть видео/аудио файл (проигрыватель с непрерывным переводом)", command=self.pick_file).pack(side="left", padx=2)
         ttk.Button(fb, text="Открыть ссылку…", command=self.pick_url).pack(side="left", padx=2)
         ttk.Button(fb, text="Установить расширение для браузера", command=self.install_extension).pack(side="left", padx=2)
+        fb2 = ttk.Frame(parent)
+        fb2.pack(fill="x", padx=10, pady=(2, 2))
+        ttk.Button(fb2, text="Выключить перевод (Esc)", command=self.stop).pack(side="left", padx=2)
+        ttk.Button(fb2, text="Перезапустить программу (двойное F10)", command=self.restart_program).pack(side="left", padx=2)
         f = ttk.Frame(parent)
         f.pack(fill="x", padx=10, pady=4)
         names = [LANGS[c][0] for c in LANGS]
@@ -3673,7 +3786,7 @@ class App:
             self.set_status("Обновление работает только в собранной программе Babelo.exe.")
             return
         if self.engine is not None:
-            self.set_status("Сначала выключите перевод (F10 два раза подряд), потом обновляйте.")
+            self.set_status("Сначала выключите перевод (Esc или кнопка «Выключить перевод»), потом обновляйте.")
             return
         if not self.pending_update:
             self.check_updates(False)
