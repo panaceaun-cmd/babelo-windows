@@ -78,7 +78,10 @@ TEST_PHRASE = {"ru": "Привет! Это проверка голоса Babelo.
 DEFAULTS = {"target": "ru", "source": "auto", "whisper": "small", "phrase_sec": 5, "pause_ms": 400,
             "speed": 100, "volume": 100, "mute_original": True, "engine": "sapi", "voice": "", "threads": 4, "github_token": "",
             "mode": "live", "pause_s": 2, "repeats": 1, "block_sec": 60, "subs": "translated",
-            "esc_stops": True, "orig_vol": 15, "text_src": "auto", "ext_prompted": False}
+            "esc_stops": True, "orig_vol": 15, "text_src": "auto", "ext_prompted": False,
+            "br_home": "https://www.google.com", "br_auto": True, "br_remember": True,
+            "br_mode": "full", "br_which": "auto", "br_search": "google", "br_ask_dir": True, "br_dl_dir": "",
+            "br_adblock": True}
 
 # ---------------------------------------------------------------- журнал и настройки
 LOG_LINES = []
@@ -1126,6 +1129,11 @@ class Bridge:
     def fresh(self):
         return self.active() is not None
 
+    def ad_active(self):
+        """В переводимом видео сейчас идёт реклама."""
+        a = self.active()
+        return bool(a and a[0].get("ad"))
+
     def snapshot(self):
         a = self.active()
         return (dict(a[0]), a[1]) if a else ({}, 0.0)
@@ -1159,6 +1167,15 @@ class Bridge:
             for k, v in self.tabs.items():
                 if k != self.pinned and now - v["t"] < 1.5 and v["state"].get("playing"):
                     return ("tab", k)
+            return None
+
+    def playing_tab(self, prefix):
+        """(вкладка, видео) играющей вкладки с таким началом номера — например "bi-" у встроенного браузера."""
+        with self.lock:
+            now = time.time()
+            for k, v in self.tabs.items():
+                if k.startswith(prefix) and now - v["t"] < 1.5 and v["state"].get("playing"):
+                    return (k, v["state"].get("vkey"))
             return None
 
     def send(self, typ, t=None, extra=None):
@@ -1241,7 +1258,7 @@ class MediaCtl:
         if BRIDGE.fresh():                                   # расширение браузера: точная позиция и перемотка
             snap, t = BRIDGE.snapshot()
             self.state = {"pos": int(float(snap.get("pos", 0)) * 1000), "playing": bool(snap.get("playing")),
-                          "seek": bool(snap.get("seek")), "rate": float(snap.get("rate") or 1.0)}
+                          "seek": bool(snap.get("seek")), "rate": float(snap.get("rate") or 1.0), "ad": bool(snap.get("ad"))}
             self.state_t = t
             if self.src != "ext":
                 self.src = "ext"
@@ -1462,7 +1479,7 @@ class Engine:
                     a = np.frombuffer(data, dtype=np.int16)
                     a = a[: len(a) // ch * ch].reshape(-1, ch).astype(np.float32) / 32768.0
                     m = to16k(a.mean(axis=1), sr)
-                if self.gate or self.hold.is_set():
+                if self.gate or self.hold.is_set() or BRIDGE.ad_active():      # свой голос, пауза или реклама
                     buf, n_samples, silent = [], 0, 0
                     continue
                 loud = len(m) > 0 and float(np.abs(m).mean()) > 0.010
@@ -2008,6 +2025,9 @@ import tkinter.font as tkfont
 BG = "#1c1c20"
 TEXT_SRC = [("auto", "Авто: субтитры видео, а если их нет — распознавание звука"),
             ("captions", "Только субтитры видео (нужно расширение в браузере)"), ("sound", "Только распознавание звука")]
+BR_MODES = [("full", "Полный браузер: вкладки, адресная строка, закладки, загрузки (как Chrome)"),
+            ("app", "Компактное окно: только страница")]
+BR_WHICH = [("auto", "Авто: Google Chrome, а если его нет — Microsoft Edge"), ("chrome", "Google Chrome"), ("edge", "Microsoft Edge")]
 MODES = [("live", "Обычный (по ходу)"),
          ("continuous", "Непрерывный: сначала подгрузка, потом только перевод"),
          ("interrupted", "Прерывистый: оригинал, потом тот же отрывок с переводом")]
@@ -2638,6 +2658,9 @@ class MpvBackend:
     def rate(self):
         return self.m.getf("speed") or 1.0
 
+    def in_ad(self):
+        return False
+
     def restore(self):
         pass
 
@@ -2671,6 +2694,9 @@ class BridgeBackend:
     def rate(self):
         st = self.media.info()
         return (st or {}).get("rate") or 1.0
+
+    def in_ad(self):
+        return BRIDGE.ad_active()
 
     def restore(self):
         BRIDGE.send("volume", None, {"v": None})
@@ -2854,6 +2880,16 @@ class ItemPlayer:
                         app.ui(app.banner.status, "Ошибка: %s" % self.error)
                         time.sleep(0.5)
                     continue
+                if be.in_ad():                                               # реклама: не переводим, время не сравниваем
+                    tts.stop_now()
+                    if shown is not None:
+                        app.ui(app.subs.hide)
+                        shown = None
+                    last_pos = None
+                    if last_status != "реклама":
+                        last_status = "реклама"
+                        app.ui(app.banner.status, "Реклама — перевод ждёт основное видео")
+                    continue
                 now = time.time()
                 paused = be.paused()
                 mode = CFG["mode"]
@@ -2973,7 +3009,8 @@ class CaptionSession(ItemPlayer):
         self.status = "Перевожу субтитры вперёд…"
         start = self.be.pos() or 0.0
         self.guard(3.0)
-        self.be.set_pause(True)                                 # видео ждёт, пока готов первый запас перевода
+        if not self.be.in_ad():
+            self.be.set_pause(True)                             # видео ждёт, пока готов первый запас перевода
         threading.Thread(target=self.pipeline, args=(max(0.0, start - 1.0), self.pipe_id), daemon=True).start()
         threading.Thread(target=self.play_loop, daemon=True).start()
 
@@ -3153,6 +3190,664 @@ class FileSession(ItemPlayer):
             log(traceback.format_exc())
             self.app.ui(self.app.subs.flash, "Файл: %s" % str(e)[:100], 6000)
 
+# ---------------------------------------------------------------- полноценная блокировка рекламы (те же списки фильтров, что у AdBlock)
+AD_LISTS = [
+    ("easylist", ["https://easylist.to/easylist/easylist.txt", "https://easylist-downloads.adblockplus.org/easylist.txt"]),
+    ("ruadlist", ["https://easylist-downloads.adblockplus.org/advblock.txt"]),
+    ("ublock", ["https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt"]),
+    ("unbreak", ["https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/unbreak.txt"]),
+]
+AD_TYPE_MAP = {"Stylesheet": "stylesheet", "Image": "image", "Media": "media", "Font": "font", "Script": "script",
+               "XHR": "xmlhttprequest", "Fetch": "xmlhttprequest", "Ping": "ping", "WebSocket": "websocket"}
+AD_OPT_TYPES = {"script", "image", "stylesheet", "object", "xmlhttprequest", "subdocument", "ping", "media", "font", "websocket",
+                "other", "document"}
+AD_BAD_SELECTOR = (":has-text", ":-abp-", ":xpath", ":matches-", ":upward", ":remove", ":style(", ":nth-ancestor",
+                   ":min-text-length", ":watch-attr", ":others", ":contains(", ":-ms-")
+_AD_TOKEN = re.compile(r"[a-z0-9%]{3,}")
+_AD_COMMON = {"http", "https", "www", "com", "html", "net", "org"}
+
+def reg_domain(host):
+    parts = host.split(".")
+    if len(parts) >= 3 and len(parts[-1]) == 2 and parts[-2] in ("co", "com", "org", "net", "gov", "ac", "edu"):
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+def host_suffixes(host):
+    parts = host.split(".")
+    return [".".join(parts[i:]) for i in range(len(parts) - 1)]
+
+def abp_regex(pat, left, right):
+    rx = re.escape(pat).replace(r"\*", ".*").replace(r"\^", r"(?:[^\w.%-]|$)")
+    prefix = r"^(?:[\w-]+:)?//(?:[^/?#]*\.)?" if left == "host" else ("^" if left == "start" else "")
+    return re.compile(prefix + rx + ("$" if right else ""), re.I)
+
+def abp_token(pat, left, right):
+    """Самый длинный «безопасный» кусок правила: по нему правило ищется быстро, а не перебором всех."""
+    best = ""
+    for m in re.finditer(r"[a-z0-9%]+", pat):
+        tok, a, b = m.group(0), m.start(), m.end()
+        if len(tok) < 3 or tok in _AD_COMMON:
+            continue
+        if a == 0 and not left:
+            continue
+        if a > 0 and pat[a - 1] == "*":
+            continue
+        if b == len(pat) and not right:
+            continue
+        if b < len(pat) and pat[b] == "*":
+            continue
+        if len(tok) > len(best):
+            best = tok
+    return best
+
+def abp_opts(o):
+    third, inc, exc, dinc, dexc = None, set(), set(), set(), set()
+    for x in o.split(","):
+        x = x.strip().lower()
+        if not x:
+            continue
+        neg = x.startswith("~")
+        k = x[1:] if neg else x
+        if k in ("third-party", "3p"):
+            third = not neg
+        elif k in ("first-party", "1p"):
+            third = neg
+        elif k in AD_OPT_TYPES:
+            (exc if neg else inc).add(k)
+        elif k in ("important", "match-case"):
+            pass
+        elif k.startswith("domain="):
+            for d in k[7:].split("|"):
+                if d.startswith("~"):
+                    dexc.add(d[1:])
+                elif d:
+                    dinc.add(d)
+        else:
+            return None                                             # неподдерживаемый параметр — правило пропускаем
+    return (third, frozenset(inc) or None, frozenset(exc), frozenset(dinc), frozenset(dexc))
+
+def abp_opts_ok(o, third, kind, page_host):
+    t, inc, exc, dinc, dexc = o
+    if t is not None and t != third:
+        return False
+    if inc is not None and kind not in inc:
+        return False
+    if kind in exc:
+        return False
+    if dinc or dexc:
+        def on(dset):
+            return any(page_host == d or page_host.endswith("." + d) for d in dset)
+        if dinc and not (page_host and on(dinc)):
+            return False
+        if dexc and page_host and on(dexc):
+            return False
+    return True
+
+class AdEngine:
+    """Блокировщик рекламы: сетевые правила EasyList/RU AdList/uBlock (подмножество синтаксиса Adblock Plus) и скрытие блоков."""
+    def __init__(self):
+        self.ready = False
+        self.loading = False
+        self.info = "Фильтры ещё не загружены"
+        self.blocked = 0
+        self._reset()
+
+    def _reset(self):
+        self.hosts, self.idx, self.rest = {}, {}, []
+        self.ex_hosts, self.ex_idx, self.ex_rest = {}, {}, []
+        self.c_idx, self.c_always, self.c_dom, self.c_exc = {}, [], {}, {}
+        self.site_allow = set()
+        self.n_net = self.n_cos = 0
+
+    # ---------- разбор строки списка
+    def add_line(self, line):
+        if not line or line[0] in "![":
+            return
+        if "##" in line or "#@#" in line:
+            self._cosmetic(line)
+            return
+        if "#?#" in line or "#$#" in line or "#%#" in line:
+            return
+        exc = line.startswith("@@")
+        if exc:
+            line = line[2:]
+        opts = None
+        i = line.rfind("$")
+        if i > 0 and re.match(r"^[~\w\-,=|.*:/]+$", line[i + 1:]) and not line.endswith("/"):
+            opts = abp_opts(line[i + 1:])
+            if opts is None:
+                return
+            line = line[:i]
+        elif i == 0:
+            return
+        if opts is None:
+            opts = (None, None, frozenset(), frozenset(), frozenset())
+        if len(line) >= 2 and line[0] == "/" and line[-1] == "/":
+            return                                                   # регулярные выражения не поддерживаем
+        left = "host" if line.startswith("||") else ("start" if line.startswith("|") else "")
+        core = line[2:] if left == "host" else (line[1:] if left == "start" else line)
+        right = core.endswith("|")
+        if right:
+            core = core[:-1]
+        core = core.lower()
+        if not core:
+            return
+        if exc and opts[1] and ("document" in opts[1]) and left == "host":     # @@||сайт^$document — сайт без блокировки
+            m = re.match(r"^([a-z0-9.-]+)\^?$", core)
+            if m:
+                self.site_allow.add(m.group(1))
+            return
+        hosts, idx, rest = (self.ex_hosts, self.ex_idx, self.ex_rest) if exc else (self.hosts, self.idx, self.rest)
+        self.n_net += 1
+        m = re.match(r"^([a-z0-9.-]+)\^?$", core) if left == "host" and not right else None
+        if m and "." in m.group(1):
+            hosts.setdefault(m.group(1), []).append(opts)
+            return
+        rule = [core, left, right, opts, None]                       # [шаблон, якорь, конец, параметры, скомпилированный]
+        tok = abp_token(core, left, right)
+        if tok:
+            idx.setdefault(tok, []).append(rule)
+        else:
+            rest.append(rule)
+
+    def _cosmetic(self, line):
+        exc = "#@#" in line
+        dom, sel = line.split("#@#" if exc else "##", 1)
+        sel = sel.strip()
+        if not sel or sel.startswith("+js") or any(b in sel for b in AD_BAD_SELECTOR):
+            return
+        domains = [d.lower() for d in dom.split(",") if d and not d.startswith("~")]
+        if exc:
+            for d in domains or ["*"]:
+                self.c_exc.setdefault(d, set()).add(sel)
+            return
+        self.n_cos += 1
+        if domains:
+            for d in domains:
+                self.c_dom.setdefault(d, []).append(sel)
+            return
+        m = re.search(r"[.#]([A-Za-z_][\w-]*)", sel)
+        if m:
+            self.c_idx.setdefault(sel[m.start()] + m.group(1), []).append(sel)
+        elif len(self.c_always) < 4000:
+            self.c_always.append(sel)
+
+    # ---------- проверка запроса
+    def _match(self, low, host, kind, third, page_host, hosts, idx, rest):
+        for suf in host_suffixes(host):
+            for o in hosts.get(suf, ()):
+                if abp_opts_ok(o, third, kind, page_host):
+                    return True
+        cands = []
+        for tok in set(_AD_TOKEN.findall(low)):
+            r = idx.get(tok)
+            if r:
+                cands.extend(r)
+        for rule in cands + rest:
+            if not abp_opts_ok(rule[3], third, kind, page_host):
+                continue
+            if rule[4] is None:
+                rule[4] = abp_regex(rule[0], rule[1], rule[2])
+            if rule[4].search(low):
+                return True
+        return False
+
+    def site_allowed(self, page_host):
+        return bool(page_host) and any(x in self.site_allow for x in host_suffixes(page_host))
+
+    def should_block(self, url, kind, page_host):
+        """True — запрос нужно заблокировать. Главные документы вкладки не блокируются."""
+        if not self.ready or kind == "document" or self.site_allowed(page_host):
+            return False
+        import urllib.parse
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+        if not host:
+            return False
+        third = bool(page_host) and reg_domain(host) != reg_domain(page_host)
+        low = url.lower()
+        if not self._match(low, host, kind, third, page_host, self.hosts, self.idx, self.rest):
+            return False
+        return not self._match(low, host, kind, third, page_host, self.ex_hosts, self.ex_idx, self.ex_rest)
+
+    def cosmetic(self, host, classes, ids, first):
+        """Селекторы скрытия для страницы: по классам и id, которые на ней есть, плюс правила для этого сайта."""
+        host = (host or "").lower()
+        if not self.ready or self.site_allowed(host):
+            return []
+        out = []
+        sufs = host_suffixes(host) if host else []
+        if first:
+            out += self.c_always
+            for d in sufs:
+                out += self.c_dom.get(d, [])
+        for c in classes[:3000]:
+            out += self.c_idx.get("." + c, [])
+        for i in ids[:3000]:
+            out += self.c_idx.get("#" + i, [])
+        exc = set(self.c_exc.get("*", set()))
+        for d in sufs:
+            exc |= self.c_exc.get(d, set())
+        return [x for x in out if x not in exc][:8000]
+
+    # ---------- загрузка и обновление списков (в фоне; сначала берутся сохранённые)
+    def load(self, force=False):
+        if self.loading:
+            return
+        self.loading = True
+        try:
+            import requests
+            d = os.path.join(DATA, "adblock")
+            os.makedirs(d, exist_ok=True)
+            texts, newest = [], 0.0
+            for name, urls in AD_LISTS:
+                path = os.path.join(d, name + ".txt")
+                stale = force or not os.path.exists(path) or time.time() - os.path.getmtime(path) > 3 * 86400
+                if stale:
+                    for u in urls:
+                        try:
+                            r = requests.get(u, timeout=60, headers={"User-Agent": "Babelo-adblock/1"})
+                            r.raise_for_status()
+                            if len(r.content) < 2000:
+                                continue
+                            with open(path + ".tmp", "wb") as f:
+                                f.write(r.content)
+                            os.replace(path + ".tmp", path)
+                            break
+                        except Exception as e:
+                            log("список фильтров %s: %s" % (name, str(e)[:80]))
+                if os.path.exists(path):
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        texts.append(f.read())
+                    newest = max(newest, os.path.getmtime(path))
+            self.ready = False
+            self._reset()
+            for text in texts:
+                for line in text.splitlines():
+                    try:
+                        self.add_line(line.strip())
+                    except Exception:
+                        pass
+            for fn in ("adblock-user.txt",):                          # свои правила в синтаксисе Adblock Plus
+                try:
+                    with open(os.path.join(DATA, fn), encoding="utf-8") as f:
+                        for line in f:
+                            self.add_line(line.strip())
+                except OSError:
+                    pass
+            try:
+                with open(os.path.join(DATA, "adblock-allow.txt"), encoding="utf-8") as f:
+                    for line in f:
+                        h = line.split("#")[0].strip().lower()
+                        if h:
+                            self.site_allow.add(h)
+            except OSError:
+                pass
+            for dom in ad_domains():
+                self.hosts.setdefault(dom, []).append((None, None, frozenset(), frozenset(), frozenset()))
+            self.ready = self.n_net > 100 or bool(self.hosts)
+            when = time.strftime("%d.%m.%Y", time.localtime(newest)) if newest else "—"
+            self.info = ("Фильтры: %d правил блокировки, %d правил скрытия, списки от %s" % (self.n_net, self.n_cos, when)
+                         if self.n_net > 100 else "Списки фильтров не скачались — работает запасной список доменов")
+            log(self.info)
+        except Exception as e:
+            self.info = "Фильтры: ошибка (%s)" % str(e)[:80]
+            log(traceback.format_exc())
+        finally:
+            self.loading = False
+
+ADBLOCK = AdEngine()
+
+# ---------------------------------------------------------------- свой браузер Babelo
+BROWSER_SHIM = r"""
+const pend = {};
+let seq = 0;
+window.__babeloReply = (id, js) => { const cb = pend[id]; if (cb) { delete pend[id]; try { cb(JSON.parse(js)); } catch (e) { cb(null); } } };
+const chrome = {
+  runtime: {
+    lastError: null,
+    getManifest: () => ({ version: "__EXTVER__" }),
+    sendMessage: (msg, cb) => {
+      cb = cb || (() => {});
+      if (!msg || msg.type !== "local") { cb({ ok: false }); return; }
+      const id = ++seq;
+      pend[id] = (data) => cb(data ? { ok: true, data } : { ok: false });
+      try { window.babeloPost(JSON.stringify({ id, path: msg.path, body: msg.body || null })); }
+      catch (e) { delete pend[id]; cb({ ok: false, error: String(e) }); return; }
+      setTimeout(() => { if (pend[id]) { delete pend[id]; cb({ ok: false, error: "timeout" }); } }, 20000);
+    }
+  },
+  storage: { local: { get: (k, cb) => cb({}), set: (o, cb) => { if (cb) cb(); } } }
+};
+"""
+
+def media_endpoint(path, body):
+    """Тот же обмен, что у расширения: состояние видео -> команда; результат команды; проверка связи."""
+    if path == "/media/state":
+        cmd = BRIDGE.update(body)
+        return {"cmd": cmd, "session": BRIDGE.session, "ext": ext_version(), "pinned": BRIDGE.pinned}
+    if path == "/media/result":
+        BRIDGE.put_result(int(body.get("id", 0)), body.get("data"))
+        return {}
+    if path == "/adblock/cosmetic":
+        return {"sel": ADBLOCK.cosmetic(body.get("host", ""), body.get("classes") or [], body.get("ids") or [], bool(body.get("first")))}
+    if path == "/ping":
+        return {"ok": True, "build": APP_BUILD, "ext": ext_version()}
+    return None
+
+AD_DOMAINS = [
+    "doubleclick.net", "googlesyndication.com", "googleadservices.com", "googletagservices.com", "adservice.google.com",
+    "2mdn.net", "adnxs.com", "adsrvr.org", "criteo.com", "criteo.net", "taboola.com", "outbrain.com", "rubiconproject.com",
+    "pubmatic.com", "openx.net", "casalemedia.com", "amazon-adsystem.com", "moatads.com", "advertising.com", "adform.net",
+    "smartadserver.com", "teads.tv", "mgid.com", "revcontent.com", "bidswitch.net", "contextweb.com", "lijit.com",
+    "sharethrough.com", "33across.com", "indexww.com", "triplelift.com", "media.net", "adcolony.com", "applovin.com",
+    "inmobi.com", "vungle.com", "chartboost.com", "adsafeprotected.com", "doubleverify.com", "serving-sys.com",
+    "popads.net", "popcash.net", "propellerads.com", "exoclick.com", "trafficjunky.com", "juicyads.com", "adsterra.com",
+    "clickadu.com", "onclickads.net", "hilltopads.net", "yandexadexchange.net", "an.yandex.ru", "adfox.ru", "begun.ru",
+    "adriver.ru", "ad.mail.ru"]
+
+def ad_domains():
+    """Встроенный список + свои домены из %LOCALAPPDATA%\\Babelo\\adblock-extra.txt (по одному в строке)."""
+    doms = list(AD_DOMAINS)
+    try:
+        with open(os.path.join(DATA, "adblock-extra.txt"), encoding="utf-8") as f:
+            for line in f:
+                d = line.split("#")[0].strip().lower()
+                if d:
+                    doms.append(d)
+    except OSError:
+        pass
+    return doms
+
+def ad_block_patterns():
+    pats = []
+    for d in ad_domains():
+        pats += ["*://%s/*" % d, "*://*.%s/*" % d]
+    return pats + ["*://*.youtube.com/pagead/*", "*://www.youtube.com/api/stats/ads*", "*://www.youtube.com/ptracking*",
+                   "*://www.youtube.com/get_midroll_info*", "*://*/pagead/ads?*"]
+
+def is_ad_url(url):
+    import urllib.parse
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if any(host == d or host.endswith("." + d) for d in ad_domains()):
+        return True
+    try:
+        return ADBLOCK.should_block(url, "other", "")
+    except Exception:
+        return False
+
+def browser_inject_script():
+    """Тот же код, что у расширения (субтитры, управление видео), но внутри собственного окна: без расширений."""
+    def rd(name):
+        with open(os.path.join(EXT_DIR, name), encoding="utf-8") as f:
+            return f.read()
+    ads = ""
+    if CFG.get("br_adblock", True):
+        try:
+            ads = rd("adblock.js") + "\n"
+        except OSError:
+            log("adblock.js не найден")
+    return ("window.__babeloBuiltin = true;\n(function(){\n" + BROWSER_SHIM.replace("__EXTVER__", ext_version()) + "\n" +
+            rd("core.js") + "\n" + rd("content_main.js") + "\n" + ads + rd("content.js") + "\n})();")
+
+def find_browser_exe(which="auto"):
+    rels = {"chrome": r"Google\Chrome\Application\chrome.exe", "edge": r"Microsoft\Edge\Application\msedge.exe"}
+    order = ["chrome", "edge"] if which in ("auto", "chrome") else ["edge", "chrome"]
+    if which in ("chrome", "edge"):
+        order = [which] + [x for x in order if x != which]          # выбранный первым, второй — запасной
+    for name in order:
+        for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"), os.environ.get("LOCALAPPDATA")):
+            if base and os.path.exists(os.path.join(base, rels[name])):
+                return os.path.join(base, rels[name])
+    return None
+
+def normalize_url(text, search="google"):
+    """Адрес, домен или слова -> ссылка; слова ищутся в Google (или на YouTube)."""
+    import urllib.parse
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if re.match(r"^[a-z][a-z0-9+.-]*://", t, re.I):
+        return t
+    if " " not in t and "." in t:
+        return "https://" + t
+    if search == "youtube":
+        return "https://www.youtube.com/results?search_query=" + urllib.parse.quote(t)
+    return "https://www.google.com/search?q=" + urllib.parse.quote(t)
+
+def prepare_browser_profile(profile):
+    """Настройки профиля до запуска: закладки на виду, вопрос «куда сохранить» при скачивании, своя папка загрузок."""
+    d = os.path.join(profile, "Default")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "Preferences")
+    try:
+        with open(path, encoding="utf-8") as f:
+            prefs = json.load(f)
+    except Exception:
+        prefs = {}
+
+    def setp(dotted, value):
+        cur = prefs
+        parts = dotted.split(".")
+        for k in parts[:-1]:
+            cur = cur.setdefault(k, {})
+        cur[parts[-1]] = value
+    setp("bookmark_bar.show_on_all_tabs", True)
+    setp("translate.enabled", True)
+    if CFG.get("br_adblock", True):
+        setp("profile.default_content_setting_values.popups", 2)               # всплывающие окна запрещены
+    setp("download.prompt_for_download", bool(CFG.get("br_ask_dir", True)))
+    folder = (CFG.get("br_dl_dir") or "").strip()
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+        setp("download.default_directory", folder)
+        setp("savefile.default_directory", folder)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(prefs, f, ensure_ascii=False)
+
+class PageConn(threading.Thread):
+    """Одна страница встроенного браузера: подключаемся по протоколу отладки, вставляем наш код, отвечаем на его запросы."""
+    def __init__(self, br, target):
+        super().__init__(daemon=True)
+        self.br, self.target, self.ws = br, target, None
+        self.lock = threading.Lock()
+        self.n = 0
+        self.main_frame = None
+        self.page_url = ""
+
+    def page_host(self):
+        import urllib.parse
+        return (urllib.parse.urlparse(self.page_url).hostname or "").lower()
+
+    def on_paused(self, p):
+        """Каждый запрос страницы либо блокируется правилами списков, либо пропускается."""
+        rid, rtype = p["requestId"], p.get("resourceType", "Other")
+        url = p.get("request", {}).get("url", "")
+        if rtype == "Document" and self.main_frame is None:
+            self.main_frame, self.page_url = p.get("frameId"), url
+        kind = AD_TYPE_MAP.get(rtype, "other")
+        if rtype == "Document":
+            kind = "document" if p.get("frameId") == self.main_frame else "subdocument"
+        block = False
+        try:
+            block = ADBLOCK.should_block(url, kind, self.page_host())
+        except Exception as e:
+            log("блокировщик: %s" % e)
+        if block:
+            ADBLOCK.blocked += 1
+            self.send("Fetch.failRequest", {"requestId": rid, "errorReason": "BlockedByClient"})
+        else:
+            self.send("Fetch.continueRequest", {"requestId": rid})
+
+    def send(self, method, params=None):
+        with self.lock:
+            self.n += 1
+            self.ws.send(json.dumps({"id": self.n, "method": method, "params": params or {}}))
+
+    def handle(self, payload, ctx):
+        req = json.loads(payload)
+        data = media_endpoint(req["path"], req.get("body") or {})
+        js = "window.__babeloReply(%d, %s)" % (req["id"], json.dumps(json.dumps(data if data is not None else {})))
+        self.send("Runtime.evaluate", {"expression": js, "contextId": ctx} if ctx else {"expression": js})
+
+    def run(self):
+        import websocket
+        try:
+            self.ws = websocket.create_connection(self.target["webSocketDebuggerUrl"], suppress_origin=True, timeout=30,
+                                                  enable_multithread=True)
+            script = self.br.script()
+            if CFG.get("br_adblock", True):
+                self.send("Network.enable")
+                self.send("Network.setBlockedURLs", {"urls": ad_block_patterns()})     # запросы к рекламным доменам
+            self.send("Runtime.enable")
+            self.send("Page.enable")
+            if CFG.get("br_adblock", True) and ADBLOCK.ready:
+                self.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
+            self.send("Runtime.addBinding", {"name": "babeloPost"})
+            self.send("Page.addScriptToEvaluateOnNewDocument", {"source": script})
+            self.send("Runtime.evaluate", {"expression": script})           # страница уже загружена — вставляем сразу
+            while not self.br.stop_evt.is_set():
+                try:
+                    raw = self.ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    continue
+                if not raw:
+                    break
+                msg = json.loads(raw)
+                method = msg.get("method")
+                if method == "Fetch.requestPaused":
+                    try:
+                        self.on_paused(msg["params"])
+                    except Exception as e:
+                        log("перехват запроса: %s" % e)
+                    continue
+                if method == "Page.frameNavigated" and not msg["params"]["frame"].get("parentId"):
+                    self.main_frame, self.page_url = msg["params"]["frame"]["id"], msg["params"]["frame"].get("url", "")
+                    continue
+                if method == "Runtime.bindingCalled" and msg["params"].get("name") == "babeloPost":
+                    try:
+                        self.handle(msg["params"]["payload"], msg["params"].get("executionContextId"))
+                    except Exception as e:
+                        log("браузер: запрос страницы: %s" % e)
+        except Exception as e:
+            log("браузер: страница отключилась (%s)" % str(e)[:100])
+        finally:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.br.pages.pop(self.target.get("id"), None)
+
+class BuiltinBrowser:
+    """Собственное окно браузера Babelo: Microsoft Edge в режиме приложения со своим профилем, под управлением программы.
+    Видео играет штатным плеером сайта (ничего не скачивается), а программа готовит перевод вперёд и управляет паузой/перемоткой."""
+    def __init__(self, app):
+        self.app = app
+        self.proc = None
+        self.port = 0
+        self.pages = {}
+        self.alive = False
+        self.exe = None
+        self.profile = None
+        self.closed = set()
+        self.stop_evt = threading.Event()
+        self._script = None
+
+    def script(self):
+        if self._script is None:
+            self._script = browser_inject_script()
+        return self._script
+
+    def open(self, text, search=None):
+        url = normalize_url(text, search or CFG.get("br_search", "google")) or CFG["br_home"]
+        if self.alive:
+            if CFG.get("br_mode") == "app" and self._page() is not None:
+                self.navigate(url)
+            else:                                       # новая вкладка в уже открытом браузере
+                subprocess.Popen([self.exe, "--user-data-dir=" + self.profile, url])
+            return
+        exe = find_browser_exe(CFG.get("br_which", "auto"))
+        if not exe:
+            raise RuntimeError("не найден Google Chrome или Microsoft Edge (нужен один из них)")
+        install_extension_files()
+        self._script = None
+        import socket
+        sk = socket.socket()
+        sk.bind(("127.0.0.1", 0))
+        self.port = sk.getsockname()[1]
+        sk.close()
+        self.exe = exe
+        self.profile = os.path.join(DATA, "browser-profile") if CFG.get("br_remember", True) else \
+            os.path.join(tempfile.gettempdir(), "babelo-browser-%d" % os.getpid())
+        try:
+            prepare_browser_profile(self.profile)
+        except Exception as e:
+            log("профиль браузера: %s" % e)
+        args = [exe, "--user-data-dir=" + self.profile, "--remote-debugging-port=%d" % self.port, "--remote-allow-origins=*",
+                "--autoplay-policy=no-user-gesture-required", "--no-first-run", "--no-default-browser-check",
+                "--disable-background-mode", "--window-size=1280,800", "--disable-session-crashed-bubble",
+                "--disable-features=IsolateOrigins,site-per-process", "--disable-site-isolation-trials"]
+        args += ["--app=" + url] if CFG.get("br_mode") == "app" else [url]
+        self.stop_evt.clear()
+        self.pages = {}
+        self.proc = subprocess.Popen(args)
+        threading.Thread(target=self._watch, daemon=True).start()
+
+    def _watch(self):
+        import requests
+        misses = 0
+        while not self.stop_evt.is_set():
+            try:
+                for t in requests.get("http://127.0.0.1:%d/json" % self.port, timeout=2).json():
+                    url = t.get("url", "")
+                    if CFG.get("br_adblock", True) and t.get("type") == "page" and is_ad_url(url):
+                        if t.get("id") not in self.closed:                              # всплывающее окно с рекламой
+                            self.closed.add(t.get("id"))
+                            try:
+                                requests.get("http://127.0.0.1:%d/json/close/%s" % (self.port, t["id"]), timeout=2)
+                                log("закрыто рекламное окно: %s" % url[:80])
+                            except Exception:
+                                pass
+                        continue
+                    if (t.get("type") == "page" and t.get("id") not in self.pages and t.get("webSocketDebuggerUrl")
+                            and not url.startswith(("devtools://", "chrome-extension://", "edge://", "chrome://", "chrome-untrusted://", "about:"))):
+                        c = PageConn(self, t)
+                        self.pages[t["id"]] = c
+                        c.start()
+                self.alive = True
+                misses = 0
+            except Exception:
+                misses += 1
+                if misses >= 6 and (self.proc is None or self.proc.poll() is not None):
+                    break
+            time.sleep(0.8)
+        self.alive = False
+        log("встроенный браузер закрыт")
+
+    def _page(self):
+        pages = [p for p in self.pages.values() if p.ws is not None]
+        return pages[-1] if pages else None
+
+    def navigate(self, url):
+        p = self._page()
+        if p is None:
+            raise RuntimeError("окно браузера ещё не готово, повторите через секунду")
+        p.send("Page.navigate", {"url": url})
+
+    def eval(self, js):
+        p = self._page()
+        if p is not None:
+            p.send("Runtime.evaluate", {"expression": js})
+
+    def close(self):
+        self.stop_evt.set()
+        self.alive = False
+        try:
+            if self.proc is not None and self.proc.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"], creationflags=0x08000000,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
 # ---------------------------------------------------------------- программа
 class App:
     def __init__(self):
@@ -3183,6 +3878,8 @@ class App:
         self.voice_thread = None
         self.voice_cancel = threading.Event()
         self._switch_seen = None
+        self._auto_key = None
+        self.browser = BuiltinBrowser(self)
         try:
             st = ttk.Style(self.root)
             st.configure("D.TLabel", background=BG, foreground="white")
@@ -3208,6 +3905,8 @@ class App:
         self.root.after(4000, lambda: self.check_updates(True))      # тихая проверка обновлений при запуске
         self.root.after(9000, self._maybe_prompt_ext)
         self.root.after(1500, self._bridge_watch)
+        if CFG.get("br_adblock", True):
+            threading.Thread(target=ADBLOCK.load, daemon=True).start()
         self.root.protocol("WM_DELETE_WINDOW", self.hide_main)
         threading.Thread(target=self._hotkey, daemon=True).start()
         self.root.after(50, self._poll)
@@ -3285,6 +3984,7 @@ class App:
             self.muter.restore()
             self.master.set(False)
             self.subs.hide()
+            self.browser.close()
             NEURAL.close()
         except Exception as e:
             log("перезапуск: %s" % e)
@@ -3310,6 +4010,13 @@ class App:
     def _bridge_watch(self):
         try:
             active = (self.engine is not None or isinstance(self.filesess, CaptionSession)) and not self.starting
+            if (CFG.get("br_auto") and self.browser.alive and self.engine is None and self.filesess is None
+                    and not self.starting):
+                key = BRIDGE.playing_tab("bi-")                       # во встроенном браузере заиграло видео
+                if key and key != self._auto_key:
+                    self._auto_key = key
+                    log("встроенный браузер: видео заиграло — включаю перевод")
+                    self.start()
             cand = BRIDGE.switch_candidate() if active else None
             now = time.time()
             if cand is None:
@@ -3336,6 +4043,8 @@ class App:
                 pass
 
     def start(self):
+        if self.engine is not None or self.filesess is not None:
+            return
         self.ensure_voice_async()
         BRIDGE.pin_best()                                         # переводим то видео, которое играет сейчас
         if not HUB.ready(CFG["whisper"]):
@@ -3432,6 +4141,7 @@ class App:
 
     def stop(self):
         self.starting = False
+        self._auto_key = BRIDGE.playing_tab("bi-") or self._auto_key      # видео играет дальше — само не включать
         BRIDGE.unpin()
         had_engine = self.engine is not None
         if self.engine is not None:
@@ -3470,6 +4180,7 @@ class App:
             self.muter.restore()
             self.master.set(False)
             self.subs.hide()
+            self.browser.close()
             NEURAL.close()
             self.root.destroy()
         finally:
@@ -3519,6 +4230,93 @@ class App:
         fb2.pack(fill="x", padx=10, pady=(2, 2))
         ttk.Button(fb2, text="Выключить перевод (Esc)", command=self.stop).pack(side="left", padx=2)
         ttk.Button(fb2, text="Перезапустить программу (двойное F10)", command=self.restart_program).pack(side="left", padx=2)
+
+        # --- встроенный браузер: окно Chrome/Edge со своим профилем Babelo, под управлением программы
+        ttk.Label(parent, text="Встроенный браузер Babelo", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 0))
+        ttk.Label(parent, text="Адрес сайта, ссылка на видео или слова для поиска в Google:",
+                  wraplength=480, justify="left").pack(anchor="w", padx=12)
+        V.br_entry = ttk.Entry(parent)
+        V.br_entry.pack(fill="x", padx=12, pady=2)
+        V.br_entry.bind("<Return>", lambda e: self.browser_open(V.br_entry.get()))
+        fb3 = ttk.Frame(parent)
+        fb3.pack(fill="x", padx=10, pady=2)
+        ttk.Button(fb3, text="Открыть / Найти в Google", command=lambda: self.browser_open(V.br_entry.get())).pack(side="left", padx=2)
+        ttk.Button(fb3, text="Найти на YouTube", command=lambda: self.browser_open(V.br_entry.get(), "youtube")).pack(side="left", padx=2)
+        ttk.Button(fb3, text="Закрыть браузер", command=self.browser.close).pack(side="left", padx=2)
+
+        def br_combo(title, pairs, key):
+            ttk.Label(parent, text=title).pack(anchor="w", padx=12)
+            cb = ttk.Combobox(parent, state="readonly", values=[t for _, t in pairs])
+            cb.set(label_of(pairs, CFG.get(key)))
+            cb.pack(fill="x", padx=12, pady=(0, 3))
+
+            def pick(_=None):
+                CFG[key] = key_of(pairs, cb.get())
+                save_settings()
+            cb.bind("<<ComboboxSelected>>", pick)
+        br_combo("Окно браузера (применяется при следующем открытии):", BR_MODES, "br_mode")
+        br_combo("Какой браузер использовать:", BR_WHICH, "br_which")
+        V.v_br_auto = tk.BooleanVar(value=bool(CFG.get("br_auto", True)))
+        V.v_br_rem = tk.BooleanVar(value=bool(CFG.get("br_remember", True)))
+        V.v_br_ask = tk.BooleanVar(value=bool(CFG.get("br_ask_dir", True)))
+        V.v_br_ads = tk.BooleanVar(value=bool(CFG.get("br_adblock", True)))
+
+        def br_opts():
+            CFG["br_auto"] = bool(V.v_br_auto.get())
+            CFG["br_remember"] = bool(V.v_br_rem.get())
+            CFG["br_ask_dir"] = bool(V.v_br_ask.get())
+            CFG["br_adblock"] = bool(V.v_br_ads.get())
+            save_settings()
+        ttk.Checkbutton(parent, text="Включать перевод видео сам, когда в браузере заиграло видео", variable=V.v_br_auto,
+                        command=br_opts).pack(anchor="w", padx=12)
+        ttk.Checkbutton(parent, text="Запоминать входы в аккаунты, закладки и историю (свой профиль)", variable=V.v_br_rem,
+                        command=br_opts).pack(anchor="w", padx=12)
+        ttk.Checkbutton(parent, text="При скачивании спрашивать, куда сохранить файл", variable=V.v_br_ask,
+                        command=br_opts).pack(anchor="w", padx=12)
+        ttk.Checkbutton(parent, text="Блокировать рекламу и всплывающие окна (списки фильтров как у AdBlock; реклама в видео не переводится)",
+                        variable=V.v_br_ads, command=br_opts).pack(anchor="w", padx=12)
+        rowa = ttk.Frame(parent)
+        rowa.pack(fill="x", padx=12, pady=(0, 3))
+        V.ad_info = ttk.Label(rowa, text=ADBLOCK.info, wraplength=330, justify="left")
+        V.ad_info.pack(side="left", fill="x", expand=True)
+        ttk.Button(rowa, text="Обновить фильтры", command=lambda: threading.Thread(target=lambda: ADBLOCK.load(True),
+                                                                                    daemon=True).start()).pack(side="left", padx=(4, 0))
+        ttk.Label(parent, text="Папка для скачанных файлов по умолчанию (пусто — «Загрузки»):").pack(anchor="w", padx=12)
+        rowd = ttk.Frame(parent)
+        rowd.pack(fill="x", padx=12, pady=(0, 3))
+        V.br_dir = ttk.Entry(rowd)
+        V.br_dir.insert(0, CFG.get("br_dl_dir", ""))
+        V.br_dir.pack(side="left", fill="x", expand=True)
+
+        def br_dir_save(_e=None):
+            CFG["br_dl_dir"] = V.br_dir.get().strip()
+            save_settings()
+
+        def br_dir_pick():
+            d = filedialog.askdirectory(parent=self.root, title="Папка для скачанных файлов")
+            if d:
+                V.br_dir.delete(0, "end")
+                V.br_dir.insert(0, d)
+                br_dir_save()
+        V.br_dir.bind("<FocusOut>", br_dir_save)
+        V.br_dir.bind("<Return>", br_dir_save)
+        ttk.Button(rowd, text="Выбрать…", command=br_dir_pick).pack(side="left", padx=(4, 0))
+        ttk.Label(parent, text="Стартовая страница браузера:").pack(anchor="w", padx=12)
+        V.br_home = ttk.Entry(parent)
+        V.br_home.insert(0, CFG.get("br_home", "https://www.google.com"))
+        V.br_home.pack(fill="x", padx=12, pady=(0, 4))
+
+        def br_home_save(_e=None):
+            CFG["br_home"] = V.br_home.get().strip() or "https://www.google.com"
+            save_settings()
+        V.br_home.bind("<FocusOut>", br_home_save)
+        V.br_home.bind("<Return>", br_home_save)
+        ttk.Label(parent, text="Перевод страницы — как в Chrome: значок перевода в адресной строке или правая кнопка → «Перевести». "
+                               "Любой язык выбирается в панели перевода (меню ⋮). Закладки: звёздочка в адресной строке или Ctrl+D. "
+                               "Свои правила — файл %LOCALAPPDATA%\\Babelo\\adblock-user.txt (синтаксис AdBlock, например ||site.com^), "
+                               "сайты без блокировки — adblock-allow.txt, свои домены — adblock-extra.txt. "
+                               "Подгрузка видео вперёд — ползунок «Непрерывный: длина отрезка подгрузки» ниже.",
+                  wraplength=480, justify="left").pack(anchor="w", padx=12, pady=(0, 6))
         f = ttk.Frame(parent)
         f.pack(fill="x", padx=10, pady=4)
         names = [LANGS[c][0] for c in LANGS]
@@ -3671,6 +4469,14 @@ class App:
         self.voice_thread = threading.Thread(target=run, daemon=True)
         self.voice_thread.start()
         self.set_status("Скачиваю нейроголос (~60 МБ) — прогресс на полосе загрузки.")
+
+    def browser_open(self, text, search=None):
+        try:
+            self.browser.open(text, search)
+            self.set_status("Встроенный браузер открыт. Включите видео — перевод начнётся сам (или нажмите F10).")
+        except Exception as e:
+            self.set_status("Встроенный браузер: %s" % e)
+            log(traceback.format_exc())
 
     def vset(self, name, **kw):
         for v in list(self.views):
@@ -3848,6 +4654,7 @@ class App:
             txt = "Перевод включён · слышу: %s · %s · фраз услышано %d, распознано %d, переведено %d, озвучено %d, ошибок %d" % (
                 sound, player, s["heard"], s["recognised"], s["translated"], s["spoken"], s["errors"])
         self.vset("stats_lbl", text=txt)
+        self.vset("ad_info", text="%s · заблокировано запросов: %d" % (ADBLOCK.info, ADBLOCK.blocked))
         self.root.after(1000, self._tick)
 
     def test_voice(self):
