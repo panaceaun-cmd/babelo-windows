@@ -13,14 +13,22 @@
   const bg = (msg) => new Promise((res) => chrome.runtime.sendMessage(msg, (r) =>
     res(r || { ok: false, error: (chrome.runtime.lastError || {}).message })));
 
+  // У каждой страницы (вкладки) свой номер: программа различает вкладки и видео в них.
+  const TAB = (window.__babeloBuiltin ? "bi-" : "") + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  function videoKey() {
+    let id = location.origin + location.pathname;
+    if (/(^|\.)youtube\.com$/.test(location.hostname)) id += "?v=" + (new URL(location.href).searchParams.get("v") || "");
+    return id;
+  }
   function pickVideo() {
-    let best = null, area = 0;
+    let best = null, area = 0, any = null;
     for (const v of document.querySelectorAll("video")) {
       if (v.readyState === 0 && v.paused) continue;
+      if (!any) any = v;
       const r = v.getBoundingClientRect();
       if (r.width * r.height > area) { area = r.width * r.height; best = v; }
     }
-    return best;
+    return best || any;                       // в фоновой вкладке размеры могут быть нулевыми
   }
 
   // ------------------------------------------------------------------ субтитры видео
@@ -116,15 +124,18 @@
     for (let i = 0; i < Math.max(x.length, y.length); i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); }
     return false;
   };
-  let nextTry = 0, lastCmd = 0, session = null;
+  let nextTry = 0, lastCmd = 0, session = null, pinnedHere = false;
   async function tick() {
-    if (Date.now() < nextTry || document.visibilityState !== "visible") return;
+    if (Date.now() < nextTry) return;
+    // фоновая вкладка молчит, кроме той, которую программа сейчас переводит
+    if (document.visibilityState !== "visible" && !pinnedHere) return;
     const v = pickVideo();
     if (!v) return;
-    const body = { pos: v.currentTime, playing: !v.paused && !v.ended, rate: v.playbackRate, ack: lastCmd,
+    const body = { tab: TAB, vkey: videoKey(), ad: !!window.__babeloAd, pos: v.currentTime, playing: !v.paused && !v.ended, rate: v.playbackRate, ack: lastCmd,
       seek: isFinite(v.duration) && v.duration > 0 && !!(v.seekable && v.seekable.length) };
     const r = await bg({ type: "local", path: "/media/state", body });
     if (!r.ok || !r.data) { nextTry = Date.now() + 3000; return; }
+    pinnedHere = r.data.pinned === TAB;
     if (r.data.session !== session) { session = r.data.session; lastCmd = 0; }
     // программа обновилась и положила новые файлы расширения: перезагружаемся один раз
     if (r.data.ext && newer(r.data.ext, MY_VERSION)) {

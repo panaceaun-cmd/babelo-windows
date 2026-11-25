@@ -81,7 +81,7 @@ DEFAULTS = {"target": "ru", "source": "auto", "whisper": "small", "phrase_sec": 
             "esc_stops": True, "orig_vol": 15, "text_src": "auto", "ext_prompted": False,
             "br_home": "https://www.google.com", "br_auto": True, "br_remember": True,
             "br_mode": "full", "br_which": "auto", "br_search": "google", "br_ask_dir": True, "br_dl_dir": "",
-            "br_adblock": True}
+            "br_adblock": True, "br_adv": True, "voice_by": {}}
 
 # ---------------------------------------------------------------- журнал и настройки
 LOG_LINES = []
@@ -102,21 +102,51 @@ def log(msg):
 
 def load_settings():
     s = dict(DEFAULTS)
-    try:
-        with open(SETTINGS_FILE, encoding="utf-8") as f:
-            s.update(json.load(f))
-    except Exception:
-        pass
+    for path in (SETTINGS_FILE, SETTINGS_FILE + ".bak"):                # основной файл, а если он повреждён — запасная копия
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                s.update(data)
+                return s
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            try:
+                log("настройки: %s не прочитан (%s)" % (os.path.basename(path), str(e)[:80]))
+            except Exception:
+                pass
     return s
 
 CFG = load_settings()
+_SAVE_LOCK = threading.Lock()
 
 def save_settings():
-    try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(CFG, f, ensure_ascii=False, indent=1)
-    except Exception:
-        pass
+    """Атомарная запись: сначала во временный файл, потом подмена — прерванная запись не может испортить настройки."""
+    with _SAVE_LOCK:
+        try:
+            data = dict(CFG)
+            if data.get("mode_fallback_from"):                          # временный откат режима не запоминаем
+                data["mode"] = data["mode_fallback_from"]
+            data.pop("mode_fallback_from", None)
+            os.makedirs(DATA, exist_ok=True)
+            tmp = SETTINGS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.exists(SETTINGS_FILE):
+                try:
+                    import shutil
+                    shutil.copyfile(SETTINGS_FILE, SETTINGS_FILE + ".bak")
+                except Exception:
+                    pass
+            os.replace(tmp, SETTINGS_FILE)
+        except Exception as e:
+            try:
+                log("настройки не сохранены: %s" % e)
+            except Exception:
+                pass
 
 def clean_text(t):
     t = re.sub(r"[^\w\s.,!?;:'\"()\-–—…]", " ", t, flags=re.UNICODE)
@@ -1814,8 +1844,8 @@ class Engine:
                 except Exception as e:
                     log("непрерывный режим: %s" % e)
                     log(traceback.format_exc())
+                    CFG["mode_fallback_from"] = CFG.get("mode_fallback_from") or CFG["mode"]     # выбранный режим сохраняется
                     CFG["mode"] = "live"
-                    save_settings()
                     self.app.ui(self.app.sync_ui)
                     self.app.ui(self.app.subs.flash, "Непрерывный режим остановлен: %s" % str(e)[:80], 5000)
             else:
@@ -1868,8 +1898,8 @@ class Engine:
         if st is None or not st["seek"]:
             app.ui(app.subs.flash, "Непрерывный режим: нужен плеер с перемоткой. Установите расширение Babelo в Chrome или Edge "
                                    "(YouTube и другие сайты) либо откройте файл в проигрывателе Babelo. Включён обычный режим.", 8000)
+            CFG["mode_fallback_from"] = CFG.get("mode_fallback_from") or CFG["mode"]         # выбранный режим сохраняется
             CFG["mode"] = "live"
-            save_settings()
             app.ui(app.sync_ui)
             return
 
@@ -2091,6 +2121,7 @@ def add_controls(parent, dark, app):
 
     def pick_mode(_=None):
         CFG["mode"] = key_of(MODES, cm.get())
+        CFG.pop("mode_fallback_from", None)
         save_settings()
         app.on_mode_changed()
     cm.bind("<<ComboboxSelected>>", pick_mode)
@@ -2376,6 +2407,59 @@ class Subtitles:
     def flash(self, text, ms=3000):
         self.show(text)
         self.job = self.root.after(ms, self.hide)
+
+def enable_clipboard(w, root):
+    """Ctrl+V/C/X/A по КОДУ клавиши (работает и с русской раскладкой), Shift+Insert и меню правой кнопки."""
+    def paste(_=None):
+        try:
+            text = root.clipboard_get()
+        except Exception:
+            return "break"
+        text = " ".join(str(text).split())
+        try:
+            if w.selection_present():
+                w.delete("sel.first", "sel.last")
+        except Exception:
+            pass
+        w.insert("insert", text)
+        return "break"
+
+    def copy(_=None, cut=False):
+        try:
+            if w.selection_present():
+                root.clipboard_clear()
+                root.clipboard_append(w.selection_get())
+                if cut:
+                    w.delete("sel.first", "sel.last")
+        except Exception:
+            pass
+        return "break"
+
+    def select_all(_=None):
+        w.select_range(0, "end")
+        w.icursor("end")
+        return "break"
+
+    def on_ctrl(e):
+        return {86: paste, 67: copy, 88: lambda: copy(cut=True), 65: select_all}.get(e.keycode, lambda: None)()
+    w.bind("<Control-KeyPress>", on_ctrl)
+    w.bind("<Shift-Insert>", paste)
+    w.bind("<Button-1>", lambda e: w.focus_force(), add="+")
+    menu = tk.Menu(w, tearoff=0)
+    menu.add_command(label="Вставить", command=paste)
+    menu.add_command(label="Копировать", command=copy)
+    menu.add_command(label="Вырезать", command=lambda: copy(cut=True))
+    menu.add_command(label="Выделить всё", command=select_all)
+    w.bind("<Button-3>", lambda e: (w.focus_force(), menu.tk_popup(e.x_root, e.y_root)))
+
+def enable_clipboard_all(parent, root):
+    for c in parent.winfo_children():
+        try:
+            if c.winfo_class() == "TEntry":
+                enable_clipboard(c, root)
+        except Exception:
+            pass
+        enable_clipboard_all(c, root)
 
 class SettingsView:
     """Виджеты одного экземпляра панели настроек (главное окно или меню по F10)."""
@@ -3190,7 +3274,7 @@ class FileSession(ItemPlayer):
             log(traceback.format_exc())
             self.app.ui(self.app.subs.flash, "Файл: %s" % str(e)[:100], 6000)
 
-# ---------------------------------------------------------------- полноценная блокировка рекламы (те же списки фильтров, что у AdBlock)
+# ---------------------------------------------------------------- полноценная блокировка рекламы (списки фильтров как у AdBlock/uBlock)
 AD_LISTS = [
     ("easylist", ["https://easylist.to/easylist/easylist.txt", "https://easylist-downloads.adblockplus.org/easylist.txt"]),
     ("ruadlist", ["https://easylist-downloads.adblockplus.org/advblock.txt"]),
@@ -3201,8 +3285,44 @@ AD_TYPE_MAP = {"Stylesheet": "stylesheet", "Image": "image", "Media": "media", "
                "XHR": "xmlhttprequest", "Fetch": "xmlhttprequest", "Ping": "ping", "WebSocket": "websocket"}
 AD_OPT_TYPES = {"script", "image", "stylesheet", "object", "xmlhttprequest", "subdocument", "ping", "media", "font", "websocket",
                 "other", "document"}
-AD_BAD_SELECTOR = (":has-text", ":-abp-", ":xpath", ":matches-", ":upward", ":remove", ":style(", ":nth-ancestor",
-                   ":min-text-length", ":watch-attr", ":others", ":contains(", ":-ms-")
+AD_TYPE_ALIAS = {"xhr": "xmlhttprequest", "frame": "subdocument", "css": "stylesheet", "doc": "document", "beacon": "ping"}
+AD_PROC_RE = re.compile(r":(has-text|-abp-contains|contains|-abp-has|matches-css(?:-before|-after)?|matches-attr|matches-media|"
+                        r"matches-path|min-text-length|upward|nth-ancestor|xpath|watch-attr|remove|style)\(")
+AD_UNSUPPORTED_SEL = (":others(", ":-abp-properties(", ":matches-property(", ":not-inline(")
+AD_SCRIPTLETS = {"abort-on-property-read", "aopr", "abort-on-property-write", "aopw", "abort-current-script", "acs", "acis",
+                 "abort-current-inline-script", "abort-on-stack-trace", "aost", "set-constant", "set", "json-prune",
+                 "json-prune-fetch-response", "no-fetch-if", "prevent-fetch", "no-xhr-if", "prevent-xhr", "no-setTimeout-if",
+                 "nostif", "prevent-setTimeout", "no-setInterval-if", "nosiif", "prevent-setInterval", "nano-setTimeout-booster",
+                 "nano-stb", "nano-setInterval-booster", "nano-sib", "addEventListener-defuser", "aeld", "ael-defuser",
+                 "prevent-addEventListener", "window.open-defuser", "nowoif", "no-window-open-if", "window-open-defuser",
+                 "remove-attr", "ra", "remove-class", "rc", "set-attr", "set-cookie", "set-local-storage-item",
+                 "set-session-storage-item", "disable-newtab-links", "alert-buster", "noeval", "href-sanitizer"}
+_GIF = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+_JS_NOOP = b"(function(){})();"
+AD_STUBS = {
+    "noopjs": ("application/javascript", _JS_NOOP), "noop.js": ("application/javascript", _JS_NOOP),
+    "noopcss": ("text/css", b""), "noop.css": ("text/css", b""),
+    "noopframe": ("text/html", b"<!DOCTYPE html><html><head></head><body></body></html>"),
+    "noop.html": ("text/html", b"<!DOCTYPE html><html><head></head><body></body></html>"),
+    "nooptext": ("text/plain", b""), "noop.txt": ("text/plain", b""), "empty": ("text/plain", b""),
+    "noopmp3-0.1s": ("audio/mpeg", b""), "noop-0.1s.mp3": ("audio/mpeg", b""),
+    "noopmp4-1s": ("video/mp4", b""), "noop-1s.mp4": ("video/mp4", b""),
+    "1x1.gif": ("image/gif", __import__("base64").b64decode(_GIF)), "1x1-transparent.gif": ("image/gif", __import__("base64").b64decode(_GIF)),
+    "2x2.png": ("image/png", __import__("base64").b64decode(_PNG)), "2x2-transparent.png": ("image/png", __import__("base64").b64decode(_PNG)),
+    "3x2.png": ("image/png", __import__("base64").b64decode(_PNG)), "3x2-transparent.png": ("image/png", __import__("base64").b64decode(_PNG)),
+    "32x32.png": ("image/png", __import__("base64").b64decode(_PNG)), "32x32-transparent.png": ("image/png", __import__("base64").b64decode(_PNG)),
+    "google-analytics_analytics.js": ("application/javascript", b"window.ga=window.ga||function(){};window.ga.loaded=true;window.dataLayer=window.dataLayer||[];"),
+    "google-analytics_ga.js": ("application/javascript", b"window._gaq=window._gaq||{push:function(){}};"),
+    "googletagmanager_gtm.js": ("application/javascript", b"window.dataLayer=window.dataLayer||[];window.google_tag_manager=window.google_tag_manager||{};"),
+    "googlesyndication_adsbygoogle.js": ("application/javascript", b"window.adsbygoogle=window.adsbygoogle||[];window.adsbygoogle.loaded=true;window.adsbygoogle.push=function(){};"),
+    "googletagservices_gpt.js": ("application/javascript", b"(function(){var c=function(){return c};var g=window.googletag=window.googletag||{};g.cmd=g.cmd||[];g.cmd.push=function(f){try{f()}catch(e){}};g.apiReady=true;g.pubadsReady=true;['pubads','defineSlot','defineOutOfPageSlot','enableServices','display','addService','setTargeting','collapseEmptyDivs','disableInitialLoad','enableSingleRequest','companionAds','sizeMapping','refresh','destroySlots'].forEach(function(n){g[n]=c});})();"),
+    "doubleclick_instream_ad_status.js": ("application/javascript", _JS_NOOP),
+}
+
+def ad_stub(name):
+    return AD_STUBS.get((name or "").lower())
+
 _AD_TOKEN = re.compile(r"[a-z0-9%]{3,}")
 _AD_COMMON = {"http", "https", "www", "com", "html", "net", "org"}
 
@@ -3216,7 +3336,12 @@ def host_suffixes(host):
     parts = host.split(".")
     return [".".join(parts[i:]) for i in range(len(parts) - 1)]
 
+def host_in(host, dset):
+    return any(host == d or host.endswith("." + d) for d in dset)
+
 def abp_regex(pat, left, right):
+    if left == "re":
+        return re.compile(pat, re.I)
     rx = re.escape(pat).replace(r"\*", ".*").replace(r"\^", r"(?:[^\w.%-]|$)")
     prefix = r"^(?:[\w-]+:)?//(?:[^/?#]*\.)?" if left == "host" else ("^" if left == "start" else "")
     return re.compile(prefix + rx + ("$" if right else ""), re.I)
@@ -3241,13 +3366,15 @@ def abp_token(pat, left, right):
     return best
 
 def abp_opts(o):
-    third, inc, exc, dinc, dexc = None, set(), set(), set(), set()
+    """Параметры правила после «$». None — правило использует то, что мы не умеем (csp, replace, header…): пропускаем его."""
+    third, inc, exc, dinc, dexc, ex = None, set(), set(), set(), set(), {}
     for x in o.split(","):
         x = x.strip().lower()
         if not x:
             continue
         neg = x.startswith("~")
         k = x[1:] if neg else x
+        k = AD_TYPE_ALIAS.get(k, k)
         if k in ("third-party", "3p"):
             third = not neg
         elif k in ("first-party", "1p"):
@@ -3255,36 +3382,82 @@ def abp_opts(o):
         elif k in AD_OPT_TYPES:
             (exc if neg else inc).add(k)
         elif k in ("important", "match-case"):
-            pass
-        elif k.startswith("domain="):
-            for d in k[7:].split("|"):
+            if k == "important":
+                ex["important"] = True
+        elif k == "all":
+            ex["all"] = True
+        elif k in ("generichide", "ghide"):
+            ex["gh"] = True
+        elif k in ("elemhide", "ehide"):
+            ex["eh"] = True
+        elif k in ("specifichide", "shide"):
+            ex["sh"] = True
+        elif k == "badfilter":
+            ex["badfilter"] = True
+        elif k == "empty":
+            ex["redirect"] = "nooptext"
+        elif k == "mp4":
+            ex["redirect"] = "noopmp4-1s"
+        elif k.startswith(("domain=", "from=")):
+            for d in k.split("=", 1)[1].split("|"):
                 if d.startswith("~"):
                     dexc.add(d[1:])
                 elif d:
                     dinc.add(d)
+        elif k.startswith("denyallow="):
+            ex["denyallow"] = set(k[10:].split("|"))
+        elif k.startswith("to="):
+            ex["to_inc"] = {d for d in k[3:].split("|") if d and not d.startswith("~")}
+            ex["to_exc"] = {d[1:] for d in k[3:].split("|") if d.startswith("~")}
+        elif k.startswith("method="):
+            ex["method"] = set(k[7:].split("|"))
+        elif k.startswith(("redirect=", "redirect-rule=")):
+            ex["redirect"] = k.split("=", 1)[1]
+        elif k.startswith("removeparam="):
+            ex["removeparam"] = x.split("=", 1)[1]                 # регистр значения сохраняем
         else:
-            return None                                             # неподдерживаемый параметр — правило пропускаем
-    return (third, frozenset(inc) or None, frozenset(exc), frozenset(dinc), frozenset(dexc))
+            return None
+    return (third, frozenset(inc) or None, frozenset(exc), frozenset(dinc), frozenset(dexc), ex or None)
 
-def abp_opts_ok(o, third, kind, page_host):
-    t, inc, exc, dinc, dexc = o
+def abp_opts_ok(o, third, kind, page_host, host="", method="", docs=False):
+    t, inc, exc, dinc, dexc, ex = o
     if t is not None and t != third:
         return False
-    if inc is not None and kind not in inc:
+    if kind == "document":
+        if docs:                                                   # вырезание параметров касается и самих страниц
+            if inc is not None and "document" not in inc:
+                return False
+        elif not ((inc and "document" in inc) or (ex and ex.get("all"))):
+            return False                                           # обычные правила главные страницы не трогают
+    elif inc is not None and kind not in inc:
         return False
     if kind in exc:
         return False
-    if dinc or dexc:
-        def on(dset):
-            return any(page_host == d or page_host.endswith("." + d) for d in dset)
-        if dinc and not (page_host and on(dinc)):
+    if dinc and not (page_host and host_in(page_host, dinc)):
+        return False
+    if dexc and page_host and host_in(page_host, dexc):
+        return False
+    if ex:
+        if ex.get("denyallow") and host_in(host, ex["denyallow"]):
             return False
-        if dexc and page_host and on(dexc):
+        if ex.get("to_inc") and not host_in(host, ex["to_inc"]):
+            return False
+        if ex.get("to_exc") and host_in(host, ex["to_exc"]):
+            return False
+        if ex.get("method") and method.lower() not in ex["method"]:
             return False
     return True
 
+NO_OPTS = (None, None, frozenset(), frozenset(), frozenset(), None)
+
+def scriptlet_bundle(host, rules):
+    """Скрипт для документов этого сайта: вызывает скриптлеты (библиотека уже вставлена в страницу)."""
+    return ("(function(){var H=%s;if(location.hostname!==H&&!location.hostname.endsWith('.'+H))return;var S=window.__babeloSL;"
+            "if(!S)return;%s.forEach(function(r){S.run(r[0],r.slice(1));});})();" % (json.dumps(host), json.dumps(rules)))
+
 class AdEngine:
-    """Блокировщик рекламы: сетевые правила EasyList/RU AdList/uBlock (подмножество синтаксиса Adblock Plus) и скрытие блоков."""
+    """Блокировщик рекламы: сетевые правила (EasyList/RU AdList/uBlock), перенаправления на заглушки, вырезание параметров,
+    скрытие блоков (в том числе по тексту и сложным условиям) и скриптлеты uBlock."""
     def __init__(self):
         self.ready = False
         self.loading = False
@@ -3295,25 +3468,34 @@ class AdEngine:
     def _reset(self):
         self.hosts, self.idx, self.rest = {}, {}, []
         self.ex_hosts, self.ex_idx, self.ex_rest = {}, {}, []
+        self.param_rules = []
         self.c_idx, self.c_always, self.c_dom, self.c_exc = {}, [], {}, {}
-        self.site_allow = set()
-        self.n_net = self.n_cos = 0
+        self.p_dom, self.p_gen = {}, []
+        self.s_dom, self.s_gen, self.s_exc = {}, [], {}
+        self.site_allow, self.site_gh, self.site_eh = set(), set(), set()
+        self.n_net = self.n_cos = self.n_scr = 0
 
     # ---------- разбор строки списка
     def add_line(self, line):
         if not line or line[0] in "![":
             return
-        if "##" in line or "#@#" in line:
-            self._cosmetic(line)
+        for sep in ("#?#", "#@#", "##"):
+            if sep in line:
+                self._cosmetic(line, sep)
+                return
+        if "#$#" in line:
+            self._cosmetic_css(line)
             return
-        if "#?#" in line or "#$#" in line or "#%#" in line:
-            return
+        if "#%#" in line or "#@$#" in line or "#@%#" in line or "$$" in line:
+            return                                                   # фрагменты ABP и фильтры HTML — не поддерживаем
         exc = line.startswith("@@")
         if exc:
             line = line[2:]
         opts = None
-        i = line.rfind("$")
-        if i > 0 and re.match(r"^[~\w\-,=|.*:/]+$", line[i + 1:]) and not line.endswith("/"):
+        j = line.lower().find("removeparam=")
+        i = line.rfind("$", 0, j) if j > 0 else line.rfind("$")        # значение removeparam может быть регулярным выражением
+        ok = i > 0 and (j > 0 or (re.match(r"^[~\w\-,=|.*:/%!]+$", line[i + 1:]) and not (line[0] == "/" and line.endswith("/"))))
+        if ok:
             opts = abp_opts(line[i + 1:])
             if opts is None:
                 return
@@ -3321,21 +3503,35 @@ class AdEngine:
         elif i == 0:
             return
         if opts is None:
-            opts = (None, None, frozenset(), frozenset(), frozenset())
-        if len(line) >= 2 and line[0] == "/" and line[-1] == "/":
-            return                                                   # регулярные выражения не поддерживаем
-        left = "host" if line.startswith("||") else ("start" if line.startswith("|") else "")
-        core = line[2:] if left == "host" else (line[1:] if left == "start" else line)
-        right = core.endswith("|")
-        if right:
-            core = core[:-1]
-        core = core.lower()
-        if not core:
+            opts = NO_OPTS
+        ex = opts[5] or {}
+        if ex.get("badfilter"):
             return
-        if exc and opts[1] and ("document" in opts[1]) and left == "host":     # @@||сайт^$document — сайт без блокировки
+        if len(line) >= 2 and line[0] == "/" and line[-1] == "/":
+            left, core, right = "re", line[1:-1], False                # регулярное выражение
+        else:
+            left = "host" if line.startswith("||") else ("start" if line.startswith("|") else "")
+            core = line[2:] if left == "host" else (line[1:] if left == "start" else line)
+            right = core.endswith("|")
+            if right:
+                core = core[:-1]
+            core = core.lower()
+        if not core:
+            if not ex.get("removeparam"):
+                return
+            core = "*"
+        if exc and left == "host":
             m = re.match(r"^([a-z0-9.-]+)\^?$", core)
-            if m:
+            if m and opts[1] and "document" in opts[1]:              # @@||сайт^$document — сайт без блокировки
                 self.site_allow.add(m.group(1))
+                return
+            if m and (ex.get("gh") or ex.get("eh") or ex.get("sh")):   # @@||сайт^$generichide и т. п.
+                (self.site_eh if ex.get("eh") else self.site_gh).add(m.group(1))
+                return
+        if ex.get("removeparam"):
+            if not exc:
+                self.n_net += 1
+                self.param_rules.append([core, left, right, opts, None, ex["removeparam"]])
             return
         hosts, idx, rest = (self.ex_hosts, self.ex_idx, self.ex_rest) if exc else (self.hosts, self.idx, self.rest)
         self.n_net += 1
@@ -3344,24 +3540,36 @@ class AdEngine:
             hosts.setdefault(m.group(1), []).append(opts)
             return
         rule = [core, left, right, opts, None]                       # [шаблон, якорь, конец, параметры, скомпилированный]
-        tok = abp_token(core, left, right)
+        tok = abp_token(core, left, right) if left != "re" else ""
         if tok:
             idx.setdefault(tok, []).append(rule)
         else:
             rest.append(rule)
 
-    def _cosmetic(self, line):
-        exc = "#@#" in line
-        dom, sel = line.split("#@#" if exc else "##", 1)
+    def _cosmetic(self, line, sep):
+        exc = sep == "#@#"
+        dom, sel = line.split(sep, 1)
         sel = sel.strip()
-        if not sel or sel.startswith("+js") or any(b in sel for b in AD_BAD_SELECTOR):
+        if not sel:
             return
         domains = [d.lower() for d in dom.split(",") if d and not d.startswith("~")]
+        if sel.startswith("+js("):
+            self._scriptlet(domains, sel, exc)
+            return
+        if sel.startswith("^") or any(b in sel for b in AD_UNSUPPORTED_SEL):
+            return
         if exc:
             for d in domains or ["*"]:
                 self.c_exc.setdefault(d, set()).add(sel)
             return
         self.n_cos += 1
+        if AD_PROC_RE.search(sel):                                  # «процедурное» правило: сложные условия решает страница
+            if domains:
+                for d in domains:
+                    self.p_dom.setdefault(d, []).append(sel)
+            elif len(self.p_gen) < 3000:
+                self.p_gen.append(sel)
+            return
         if domains:
             for d in domains:
                 self.c_dom.setdefault(d, []).append(sel)
@@ -3372,62 +3580,168 @@ class AdEngine:
         elif len(self.c_always) < 4000:
             self.c_always.append(sel)
 
+    def _cosmetic_css(self, line):
+        """domain#$#селектор { свойства } — то же, что :style(...)"""
+        dom, body = line.split("#$#", 1)
+        m = re.match(r"^(.+?)\s*\{\s*(.+?)\s*\}\s*$", body.strip())
+        if not m or "abp-" in body:
+            return
+        sel = "%s:style(%s)" % (m.group(1), m.group(2))
+        domains = [d.lower() for d in dom.split(",") if d and not d.startswith("~")]
+        self.n_cos += 1
+        for d in domains or ["*"]:
+            if d == "*":
+                if len(self.p_gen) < 3000:
+                    self.p_gen.append(sel)
+            else:
+                self.p_dom.setdefault(d, []).append(sel)
+
+    def _scriptlet(self, domains, sel, exc):
+        inner = sel[4:]
+        if inner.endswith(")"):
+            inner = inner[:-1]
+        args = [a.strip().replace("\\,", ",") for a in re.split(r"(?<!\\),", inner)]
+        if exc:
+            for d in domains or ["*"]:
+                self.s_exc.setdefault(d, set()).add(json.dumps(args) if args and args[0] else "ALL")
+            return
+        if not args or args[0] not in AD_SCRIPTLETS:
+            return                                                   # неизвестные и «trusted-…» скриптлеты пропускаем
+        self.n_scr += 1
+        if domains:
+            for d in domains:
+                self.s_dom.setdefault(d, []).append(args)
+        else:
+            self.s_gen.append(args)
+
     # ---------- проверка запроса
-    def _match(self, low, host, kind, third, page_host, hosts, idx, rest):
+    def _match(self, low, host, kind, third, page_host, method, hosts, idx, rest):
+        """Возвращает параметры сработавшего правила или None."""
         for suf in host_suffixes(host):
             for o in hosts.get(suf, ()):
-                if abp_opts_ok(o, third, kind, page_host):
-                    return True
+                if abp_opts_ok(o, third, kind, page_host, host, method):
+                    return o
         cands = []
         for tok in set(_AD_TOKEN.findall(low)):
             r = idx.get(tok)
             if r:
                 cands.extend(r)
         for rule in cands + rest:
-            if not abp_opts_ok(rule[3], third, kind, page_host):
+            if not abp_opts_ok(rule[3], third, kind, page_host, host, method):
                 continue
             if rule[4] is None:
-                rule[4] = abp_regex(rule[0], rule[1], rule[2])
-            if rule[4].search(low):
-                return True
-        return False
+                try:
+                    rule[4] = abp_regex(rule[0], rule[1], rule[2])
+                except re.error:
+                    rule[4] = False
+            if rule[4] and rule[4].search(low):
+                return rule[3]
+        return None
 
     def site_allowed(self, page_host):
         return bool(page_host) and any(x in self.site_allow for x in host_suffixes(page_host))
 
-    def should_block(self, url, kind, page_host):
-        """True — запрос нужно заблокировать. Главные документы вкладки не блокируются."""
-        if not self.ready or kind == "document" or self.site_allowed(page_host):
-            return False
+    def decide(self, url, kind, page_host, method="GET"):
+        """None — пропустить; ("block",); ("redirect", имя заглушки); ("url", новый адрес без лишних параметров)."""
+        if not self.ready or self.site_allowed(page_host):
+            return None
         import urllib.parse
         host = (urllib.parse.urlparse(url).hostname or "").lower()
         if not host:
-            return False
+            return None
         third = bool(page_host) and reg_domain(host) != reg_domain(page_host)
         low = url.lower()
-        if not self._match(low, host, kind, third, page_host, self.hosts, self.idx, self.rest):
-            return False
-        return not self._match(low, host, kind, third, page_host, self.ex_hosts, self.ex_idx, self.ex_rest)
+        m = self._match(low, host, kind, third, page_host, method, self.hosts, self.idx, self.rest)
+        if m is not None and not (m[5] or {}).get("important"):
+            if self._match(low, host, kind, third, page_host, method, self.ex_hosts, self.ex_idx, self.ex_rest) is not None:
+                m = None
+        if m is not None:
+            red = (m[5] or {}).get("redirect")
+            return ("redirect", red) if red else ("block",)
+        if self.param_rules and "?" in url:
+            new = self._strip_params(url, low, host, kind, third, page_host, method)
+            if new:
+                return ("url", new)
+        return None
+
+    def _strip_params(self, url, low, host, kind, third, page_host, method):
+        import urllib.parse
+        sp = urllib.parse.urlsplit(url)
+        pairs = sp.query.split("&")
+        out = pairs
+        for rule in self.param_rules:
+            if not abp_opts_ok(rule[3], third, kind, page_host, host, method, docs=True):
+                continue
+            if rule[4] is None:
+                try:
+                    rule[4] = abp_regex(rule[0], rule[1], rule[2])
+                except re.error:
+                    rule[4] = False
+            if not rule[4] or not rule[4].search(low):
+                continue
+            spec = rule[5]
+            m = re.match(r"^/(.+)/(i?)$", spec)
+            if m:
+                try:
+                    rx = re.compile(m.group(1), re.I if m.group(2) else 0)
+                except re.error:
+                    continue
+                out = [p for p in out if not rx.search(urllib.parse.unquote_plus(p))]
+            elif spec.startswith("~"):
+                keep = set(spec[1:].split("|"))
+                out = [p for p in out if p.split("=", 1)[0] in keep]
+            else:
+                names = set(spec.split("|"))
+                out = [p for p in out if p.split("=", 1)[0] not in names]
+        if len(out) == len(pairs):
+            return None
+        return urllib.parse.urlunsplit((sp.scheme, sp.netloc, sp.path, "&".join(p for p in out if p), sp.fragment))
+
+    def should_block(self, url, kind, page_host):
+        d = self.decide(url, kind, page_host)
+        return d is not None and d[0] in ("block", "redirect")
 
     def cosmetic(self, host, classes, ids, first):
-        """Селекторы скрытия для страницы: по классам и id, которые на ней есть, плюс правила для этого сайта."""
+        """(обычные селекторы, процедурные правила) для страницы: по её классам и id плюс правила для этого сайта."""
         host = (host or "").lower()
         if not self.ready or self.site_allowed(host):
-            return []
-        out = []
+            return [], []
         sufs = host_suffixes(host) if host else []
+        if any(x in self.site_eh for x in sufs):
+            return [], []
+        generic = not any(x in self.site_gh for x in sufs)
+        out, proc = [], []
         if first:
-            out += self.c_always
+            if generic:
+                out += self.c_always
+                proc += self.p_gen
             for d in sufs:
                 out += self.c_dom.get(d, [])
-        for c in classes[:3000]:
-            out += self.c_idx.get("." + c, [])
-        for i in ids[:3000]:
-            out += self.c_idx.get("#" + i, [])
+                proc += self.p_dom.get(d, [])
+        if generic:
+            for c in classes[:3000]:
+                out += self.c_idx.get("." + c, [])
+            for i in ids[:3000]:
+                out += self.c_idx.get("#" + i, [])
         exc = set(self.c_exc.get("*", set()))
         for d in sufs:
             exc |= self.c_exc.get(d, set())
-        return [x for x in out if x not in exc][:8000]
+        return [x for x in out if x not in exc][:8000], [x for x in proc if x not in exc][:1500]
+
+    def scriptlets_for(self, host):
+        host = (host or "").lower()
+        if not self.ready or not host or self.site_allowed(host):
+            return []
+        sufs = host_suffixes(host)
+        exc = set(self.s_exc.get("*", set()))
+        for d in sufs:
+            exc |= self.s_exc.get(d, set())
+        if "ALL" in exc:
+            return []
+        rules = list(self.s_gen)
+        for d in sufs:
+            rules += self.s_dom.get(d, [])
+        return [r for r in rules if json.dumps(r) not in exc][:200]
 
     # ---------- загрузка и обновление списков (в фоне; сначала берутся сохранённые)
     def load(self, force=False):
@@ -3445,7 +3759,7 @@ class AdEngine:
                 if stale:
                     for u in urls:
                         try:
-                            r = requests.get(u, timeout=60, headers={"User-Agent": "Babelo-adblock/1"})
+                            r = requests.get(u, timeout=60, headers={"User-Agent": "Babelo-adblock/2"})
                             r.raise_for_status()
                             if len(r.content) < 2000:
                                 continue
@@ -3461,19 +3775,27 @@ class AdEngine:
                     newest = max(newest, os.path.getmtime(path))
             self.ready = False
             self._reset()
+            bad = set()                                               # $badfilter отменяет такое же правило
             for text in texts:
                 for line in text.splitlines():
+                    if "badfilter" in line and "$" in line and "##" not in line:
+                        t = re.sub(r",badfilter|badfilter,", "", line.strip())
+                        bad.add(t[:-10] if t.endswith("$badfilter") else t)
+            for text in texts:
+                for line in text.splitlines():
+                    l = line.strip()
+                    if bad and l in bad:
+                        continue
                     try:
-                        self.add_line(line.strip())
+                        self.add_line(l)
                     except Exception:
                         pass
-            for fn in ("adblock-user.txt",):                          # свои правила в синтаксисе Adblock Plus
-                try:
-                    with open(os.path.join(DATA, fn), encoding="utf-8") as f:
-                        for line in f:
-                            self.add_line(line.strip())
-                except OSError:
-                    pass
+            try:
+                with open(os.path.join(DATA, "adblock-user.txt"), encoding="utf-8") as f:     # свои правила (синтаксис AdBlock)
+                    for line in f:
+                        self.add_line(line.strip())
+            except OSError:
+                pass
             try:
                 with open(os.path.join(DATA, "adblock-allow.txt"), encoding="utf-8") as f:
                     for line in f:
@@ -3483,10 +3805,10 @@ class AdEngine:
             except OSError:
                 pass
             for dom in ad_domains():
-                self.hosts.setdefault(dom, []).append((None, None, frozenset(), frozenset(), frozenset()))
+                self.hosts.setdefault(dom, []).append(NO_OPTS)
             self.ready = self.n_net > 100 or bool(self.hosts)
             when = time.strftime("%d.%m.%Y", time.localtime(newest)) if newest else "—"
-            self.info = ("Фильтры: %d правил блокировки, %d правил скрытия, списки от %s" % (self.n_net, self.n_cos, when)
+            self.info = ("Фильтры: %d правил блокировки, %d правил скрытия, %d скриптлетов, списки от %s" % (self.n_net, self.n_cos, self.n_scr, when)
                          if self.n_net > 100 else "Списки фильтров не скачались — работает запасной список доменов")
             log(self.info)
         except Exception as e:
@@ -3529,7 +3851,8 @@ def media_endpoint(path, body):
         BRIDGE.put_result(int(body.get("id", 0)), body.get("data"))
         return {}
     if path == "/adblock/cosmetic":
-        return {"sel": ADBLOCK.cosmetic(body.get("host", ""), body.get("classes") or [], body.get("ids") or [], bool(body.get("first")))}
+        sel, proc = ADBLOCK.cosmetic(body.get("host", ""), body.get("classes") or [], body.get("ids") or [], bool(body.get("first")))
+        return {"sel": sel, "proc": proc}
     if path == "/ping":
         return {"ok": True, "build": APP_BUILD, "ext": ext_version()}
     return None
@@ -3583,9 +3906,12 @@ def browser_inject_script():
     ads = ""
     if CFG.get("br_adblock", True):
         try:
-            ads = rd("adblock.js") + "\n"
+            safe = lambda js: "try{\n" + js + "\n}catch(e){}\n"           # сбой одной части не должен ломать остальные
+            if CFG.get("br_adv", True):
+                ads += safe(rd("scriptlets.js")) + safe(rd("procedural.js"))
+            ads += safe(rd("adblock.js"))
         except OSError:
-            log("adblock.js не найден")
+            log("файлы блокировщика не найдены")
     return ("window.__babeloBuiltin = true;\n(function(){\n" + BROWSER_SHIM.replace("__EXTVER__", ext_version()) + "\n" +
             rd("core.js") + "\n" + rd("content_main.js") + "\n" + ads + rd("content.js") + "\n})();")
 
@@ -3653,30 +3979,58 @@ class PageConn(threading.Thread):
         self.n = 0
         self.main_frame = None
         self.page_url = ""
+        self.sl_hosts = set()
 
     def page_host(self):
         import urllib.parse
         return (urllib.parse.urlparse(self.page_url).hostname or "").lower()
 
+    def install_scriptlets(self, host, now=False):
+        """Скриптлеты для сайта вставляются в документы этого сайта ДО скриптов страницы."""
+        if not (CFG.get("br_adblock", True) and CFG.get("br_adv", True) and ADBLOCK.ready) or not host or host in self.sl_hosts:
+            return
+        self.sl_hosts.add(host)
+        rules = ADBLOCK.scriptlets_for(host)
+        if not rules:
+            return
+        src = scriptlet_bundle(host, rules)
+        self.send("Page.addScriptToEvaluateOnNewDocument", {"source": src})
+        if now:
+            self.send("Runtime.evaluate", {"expression": src})
+
     def on_paused(self, p):
-        """Каждый запрос страницы либо блокируется правилами списков, либо пропускается."""
+        """Каждый запрос страницы: блокируется, подменяется заглушкой, очищается от лишних параметров или пропускается."""
+        import urllib.parse
         rid, rtype = p["requestId"], p.get("resourceType", "Other")
-        url = p.get("request", {}).get("url", "")
+        req = p.get("request", {})
+        url = req.get("url", "")
         if rtype == "Document" and self.main_frame is None:
             self.main_frame, self.page_url = p.get("frameId"), url
         kind = AD_TYPE_MAP.get(rtype, "other")
         if rtype == "Document":
             kind = "document" if p.get("frameId") == self.main_frame else "subdocument"
-        block = False
+            self.install_scriptlets((urllib.parse.urlparse(url).hostname or "").lower())
+        decision = None
         try:
-            block = ADBLOCK.should_block(url, kind, self.page_host())
+            decision = ADBLOCK.decide(url, kind, self.page_host(), req.get("method", "GET"))
         except Exception as e:
             log("блокировщик: %s" % e)
-        if block:
-            ADBLOCK.blocked += 1
-            self.send("Fetch.failRequest", {"requestId": rid, "errorReason": "BlockedByClient"})
-        else:
+        if decision is None:
             self.send("Fetch.continueRequest", {"requestId": rid})
+            return
+        ADBLOCK.blocked += 1
+        if decision[0] == "redirect" and ad_stub(decision[1]):
+            import base64
+            mime, body = ad_stub(decision[1])
+            self.send("Fetch.fulfillRequest", {"requestId": rid, "responseCode": 200,
+                                               "responseHeaders": [{"name": "Content-Type", "value": mime},
+                                                                   {"name": "Access-Control-Allow-Origin", "value": "*"}],
+                                               "body": base64.b64encode(body).decode()})
+        elif decision[0] == "url":
+            ADBLOCK.blocked -= 1
+            self.send("Fetch.continueRequest", {"requestId": rid, "url": decision[1]})
+        else:
+            self.send("Fetch.failRequest", {"requestId": rid, "errorReason": "BlockedByClient"})
 
     def send(self, method, params=None):
         with self.lock:
@@ -3705,6 +4059,8 @@ class PageConn(threading.Thread):
             self.send("Runtime.addBinding", {"name": "babeloPost"})
             self.send("Page.addScriptToEvaluateOnNewDocument", {"source": script})
             self.send("Runtime.evaluate", {"expression": script})           # страница уже загружена — вставляем сразу
+            import urllib.parse
+            self.install_scriptlets((urllib.parse.urlparse(self.target.get("url", "")).hostname or "").lower(), now=True)
             while not self.br.stop_evt.is_set():
                 try:
                     raw = self.ws.recv()
@@ -3979,6 +4335,7 @@ class App:
     def restart_program(self):
         """Принудительно закрывает программу целиком (перевод, голос, звук, фоновые процессы) и запускает её заново."""
         log("двойное F10: полный перезапуск программы")
+        save_settings()
         try:
             self.stop()
             self.muter.restore()
@@ -4045,6 +4402,9 @@ class App:
     def start(self):
         if self.engine is not None or self.filesess is not None:
             return
+        if CFG.get("mode_fallback_from"):                         # прошлый раз режим временно откатился — пробуем выбранный снова
+            CFG["mode"] = CFG.pop("mode_fallback_from")
+            self.sync_ui()
         self.ensure_voice_async()
         BRIDGE.pin_best()                                         # переводим то видео, которое играет сейчас
         if not HUB.ready(CFG["whisper"]):
@@ -4182,6 +4542,7 @@ class App:
             self.subs.hide()
             self.browser.close()
             NEURAL.close()
+            save_settings()
             self.root.destroy()
         finally:
             os._exit(0)
@@ -4240,6 +4601,14 @@ class App:
         V.br_entry.bind("<Return>", lambda e: self.browser_open(V.br_entry.get()))
         fb3 = ttk.Frame(parent)
         fb3.pack(fill="x", padx=10, pady=2)
+        def br_paste():
+            try:
+                text = " ".join(self.root.clipboard_get().split())
+            except Exception:
+                text = ""
+            V.br_entry.delete(0, "end")
+            V.br_entry.insert(0, text)
+        ttk.Button(fb3, text="Вставить", command=br_paste).pack(side="left", padx=2)
         ttk.Button(fb3, text="Открыть / Найти в Google", command=lambda: self.browser_open(V.br_entry.get())).pack(side="left", padx=2)
         ttk.Button(fb3, text="Найти на YouTube", command=lambda: self.browser_open(V.br_entry.get(), "youtube")).pack(side="left", padx=2)
         ttk.Button(fb3, text="Закрыть браузер", command=self.browser.close).pack(side="left", padx=2)
@@ -4260,12 +4629,14 @@ class App:
         V.v_br_rem = tk.BooleanVar(value=bool(CFG.get("br_remember", True)))
         V.v_br_ask = tk.BooleanVar(value=bool(CFG.get("br_ask_dir", True)))
         V.v_br_ads = tk.BooleanVar(value=bool(CFG.get("br_adblock", True)))
+        V.v_br_adv = tk.BooleanVar(value=bool(CFG.get("br_adv", True)))
 
         def br_opts():
             CFG["br_auto"] = bool(V.v_br_auto.get())
             CFG["br_remember"] = bool(V.v_br_rem.get())
             CFG["br_ask_dir"] = bool(V.v_br_ask.get())
             CFG["br_adblock"] = bool(V.v_br_ads.get())
+            CFG["br_adv"] = bool(V.v_br_adv.get())
             save_settings()
         ttk.Checkbutton(parent, text="Включать перевод видео сам, когда в браузере заиграло видео", variable=V.v_br_auto,
                         command=br_opts).pack(anchor="w", padx=12)
@@ -4275,6 +4646,9 @@ class App:
                         command=br_opts).pack(anchor="w", padx=12)
         ttk.Checkbutton(parent, text="Блокировать рекламу и всплывающие окна (списки фильтров как у AdBlock; реклама в видео не переводится)",
                         variable=V.v_br_ads, command=br_opts).pack(anchor="w", padx=12)
+        ttk.Checkbutton(parent, text="Расширенные правила uBlock: скриптлеты, фильтры по тексту, заглушки вместо рекламных скриптов "
+                                     "(отключите, если какой-то сайт работает неправильно)",
+                        variable=V.v_br_adv, command=br_opts).pack(anchor="w", padx=12)
         rowa = ttk.Frame(parent)
         rowa.pack(fill="x", padx=12, pady=(0, 3))
         V.ad_info = ttk.Label(rowa, text=ADBLOCK.info, wraplength=330, justify="left")
@@ -4347,7 +4721,7 @@ class App:
             CFG["source"] = "auto" if n == "Авто" else codes[names.index(n)]
             save_settings()
 
-        def fill_voices(_=None):
+        def fill_voices(_=None, reset=False):
             lang = CFG["target"]
             if CFG["engine"] == "edge":
                 vals = LANGS[lang][3]
@@ -4358,14 +4732,16 @@ class App:
             else:
                 vals = list_sapi_voices(lang)
             V.cv.config(values=vals)
-            if CFG.get("voice") not in vals:
-                CFG["voice"] = vals[0] if vals else ""
-            V.v_voice.set(CFG["voice"])
+            key = "%s:%s" % (CFG["engine"], lang)
+            if reset and vals and CFG.get("voice") not in vals:         # язык или тип озвучки сменил пользователь
+                remembered = (CFG.get("voice_by") or {}).get(key)
+                CFG["voice"] = remembered if remembered in vals else vals[0]
+            V.v_voice.set(CFG.get("voice", ""))                         # при запуске сохранённый голос не трогаем
 
         def pick_dst(_=None):
             CFG["target"] = codes[names.index(V.v_dst.get())]
+            fill_voices(reset=True)
             save_settings()
-            fill_voices()
             self.ensure_voice_async()
 
         def pick_whisper(_=None):
@@ -4377,12 +4753,13 @@ class App:
 
         def pick_engine(_=None):
             CFG["engine"] = key_of(ENGINES, V.v_engine.get())
+            fill_voices(reset=True)
             save_settings()
-            fill_voices()
             self.ensure_voice_async()
 
         def pick_voice(_=None):
             CFG["voice"] = V.v_voice.get()
+            CFG.setdefault("voice_by", {})["%s:%s" % (CFG["engine"], CFG["target"])] = CFG["voice"]
             save_settings()
             self.ensure_voice_async()
         cs.bind("<<ComboboxSelected>>", pick_src)
@@ -4443,6 +4820,7 @@ class App:
         ttk.Button(bar, text="Проверить голос", command=self.test_voice).pack(side="left", padx=4)
         if dark:
             restyle(parent)
+        enable_clipboard_all(parent, self.root)
         self.views.append(V)
         return V
 
@@ -4627,6 +5005,7 @@ class App:
         self.set_status("Устанавливаю обновление… Babelo закроется, откроется чёрное окно установки (не закрывайте его) — потом программа запустится сама.")
         self.muter.restore()
         self.master.set(False)
+        save_settings()
         try:
             NEURAL.close()
         except Exception:
