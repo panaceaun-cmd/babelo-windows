@@ -10,6 +10,8 @@ comtypes
 psutil
 pywin32
 edge-tts
+Pillow
+pystray
 websocket-client
 sherpa-onnx>=1.12,<2
 sherpa-onnx-core>=1.12,<2
